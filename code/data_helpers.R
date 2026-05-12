@@ -1082,7 +1082,7 @@ drop_non_autosomal_probes <- function(mat) {
   # This is Step 3b of the preprocessing pipeline.
   #
   # INPUT:
-  #   mat - Numeric matrix (probes × samples) with rownames = probe IDs
+  #   mat - Numeric matrix (probes x samples) with rownames = probe IDs
   #
   # OUTPUT:
   #   Currently returns input unchanged (stub function)
@@ -1108,7 +1108,7 @@ drop_cross_reactive_probes <- function(mat, cross_reactive = character()) {
   # This is Step 3c of the preprocessing pipeline.
   #
   # INPUT:
-  #   mat - Numeric matrix (probes × samples) with rownames = probe IDs
+  #   mat - Numeric matrix (probes x samples) with rownames = probe IDs
   #   cross_reactive - Character vector of probe IDs to remove
   #
   # OUTPUT:
@@ -1253,7 +1253,7 @@ build_pheno_sample_keys <- function(ph) {
 #
 # INPUT:
 #   ph  - Phenotype data frame (typically from fetch_gse_pheno + age extraction)
-#   mat - Methylation matrix (probes × samples) from IDAT or series matrix
+#   mat - Methylation matrix (probes x samples) from IDAT or series matrix
 #
 # OUTPUT:
 #   List with two elements:
@@ -1268,9 +1268,23 @@ build_pheno_sample_keys <- function(ph) {
 #   - Validates that ph and mat are perfectly aligned after matching
 
 align_pheno_to_matrix <- function(ph, mat) {
-  if (is.null(mat) || is.null(ph) || ncol(mat) == 0 || nrow(ph) == 0) {
-    return(list(ph = ph[0, , drop = FALSE], mat = mat[, 0, drop = FALSE]))
-  }
+  # Robust null/empty checks - handle all edge cases
+  tryCatch({
+    if (is.null(mat) || is.null(ph)) {
+      return(list(ph = ph[0, , drop = FALSE], mat = mat[, 0, drop = FALSE]))
+    }
+    
+    mat_cols <- ncol(mat)
+    ph_rows <- nrow(ph)
+    
+    # Check for NA, NULL, or 0
+    if (is.na(mat_cols) || is.na(ph_rows) || mat_cols == 0 || ph_rows == 0) {
+      return(list(ph = ph[0, , drop = FALSE], mat = mat[, 0, drop = FALSE]))
+    }
+  }, error = function(e) {
+    # If matrix/phenotype structure is malformed, return empty
+    return(list(ph = data.frame(), mat = matrix(nrow=0, ncol=0)))
+  })
 
   ph <- ph |> dplyr::mutate(sample_key = build_pheno_sample_keys(ph))
 
@@ -1280,22 +1294,68 @@ align_pheno_to_matrix <- function(ph, mat) {
   idx <- match(col_keys, ph$sample_key)
 
   keep_cols <- !is.na(idx)
+  
+  # Debug: Check if any samples matched
+  n_matched <- sum(keep_cols)
+  if (n_matched == 0) {
+    message("    [DEBUG] No samples matched during alignment!")
+    message("      Matrix column names sample: ", paste(head(colnames(mat), 3), collapse = ", "))
+    message("      Phenotype sample keys sample: ", paste(head(ph$sample_key, 3), collapse = ", "))
+    message("      This likely means phenotype and matrix use different sample identifiers.")
+    return(list(ph = ph[0, , drop = FALSE], mat = mat[, 0, drop = FALSE]))
+  }
+  
   mat2 <- mat[, keep_cols, drop = FALSE]
   idx2 <- idx[keep_cols]
   ph2 <- ph[idx2, , drop = FALSE]
 
   # replace matrix colnames with stable sample IDs
   stable_ids <- if ("geo_accession" %in% names(ph2)) ph2$geo_accession else ph2$sample_key
-  colnames(mat2) <- stable_ids
+  colnames(mat2) <- as.character(stable_ids)
 
   # de-duplicate sample IDs if needed
-  if (anyDuplicated(colnames(mat2)) > 0) {
+  # Handle duplicates in both matrix colnames AND phenotype
+  if (anyDuplicated(colnames(mat2)) > 0 || anyDuplicated(stable_ids) > 0) {
+    # Keep first occurrence of each unique ID
     dup_id <- duplicated(colnames(mat2))
-    mat2 <- mat2[, !dup_id, drop = FALSE]
-    ph2 <- ph2[!dup_id, , drop = FALSE]
+    
+    keep_idx <- !dup_id
+    mat2 <- mat2[, keep_idx, drop = FALSE]
+    ph2 <- ph2[keep_idx, , drop = FALSE]
+    
+    # Re-compute stable_ids after filtering
+    stable_ids <- if ("geo_accession" %in% names(ph2)) ph2$geo_accession else ph2$sample_key
+    colnames(mat2) <- as.character(stable_ids)
   }
 
-  stopifnot(identical(colnames(mat2), if ("geo_accession" %in% names(ph2)) ph2$geo_accession else ph2$sample_key))
+  # Final check - both lengths and values should match
+  expected_ids <- if ("geo_accession" %in% names(ph2)) ph2$geo_accession else ph2$sample_key
+  expected_ids <- as.character(expected_ids)
+  mat_colnames <- as.character(colnames(mat2))
+  
+  if (!identical(mat_colnames, expected_ids)) {
+    mat_names <- mat_colnames
+    ph_names <- expected_ids
+    
+    message("    [ERROR] Sample ID mismatch during alignment:")
+    message("      Matrix columns: ", length(mat_names), " samples")
+    message("      Phenotype rows: ", length(ph_names), " samples")
+    
+    if (length(mat_names) != length(ph_names)) {
+      message("      Length mismatch! Matrix and phenotype have different sizes.")
+    } else {
+      # Same length but different order or values
+      mismatch_idx <- which(mat_names != ph_names)
+      if (length(mismatch_idx) > 0) {
+        message("      Order or value mismatch at positions: ", 
+          paste(head(mismatch_idx, 5), collapse = ", "))
+        message("      First few matrix names: ", paste(head(mat_names, 3), collapse = ", "))
+        message("      First few pheno names: ", paste(head(ph_names, 3), collapse = ", "))
+      }
+    }
+    
+    stop("Sample ID mismatch in alignment for this study. Check phenotype duplicates or sample_key generation.")
+  }
 
   list(ph = ph2, mat = mat2)
 }
@@ -1311,7 +1371,7 @@ align_pheno_to_matrix <- function(ph, mat) {
 #   gse_dir - Directory containing downloaded IDAT files for a study
 #
 # OUTPUT:
-#   Numeric matrix (probes × samples) with beta values in [0, 1].
+#   Numeric matrix (probes x samples) with beta values in [0, 1].
 #   Returns NULL if no complete IDAT pairs are found.
 #
 # NOTES:

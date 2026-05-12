@@ -107,7 +107,7 @@
 #                   written to disk so each step of the pipeline can be
 #                   inspected or reproduced.
 #
-#  UPDATED: 2026-04-28
+#  UPDATED: 2026-04-27
 #
 #===============================================================================
 
@@ -491,7 +491,7 @@ SKIP_STEP_1 <- FALSE
 
 STEP_1_CHECKPOINT <- fs::path(DIR_INTER, "step_1_phenotype_checkpoint.qs")
 
-if (SKIP_STEP_1 && file.exists(STEP_1_CHECKPOINT)) {                            
+if (SKIP_STEP_1 && file.exists(STEP_1_CHECKPOINT)) {                             ### QC CODE CHECKS UP TO HERE
 
   message("\n[STEP 1/6] Loading phenotype data from checkpoint...")
 
@@ -639,7 +639,7 @@ if (!SKIP_STEP_2 || is.null(studies_loaded)) {
       studies[[gse_id]]$method <- NA_character_
 
     } else {
-      message(" ✓ (", nrow(beta), " probes x ", ncol(beta), " samples)")
+      message(" (OK) (", nrow(beta), " probes x ", ncol(beta), " samples)")
       studies[[gse_id]]$meth <- beta
       studies[[gse_id]]$method <- method
     }
@@ -722,7 +722,7 @@ if (!SKIP_STEP_3 || is.null(studies_loaded)) {
   safe_checkpoint_save(studies, STEP_3_CHECKPOINT)
 }
 
-#--- STEP 4: ALIGN PHENOTYPE TO METHYLATION MATRIX -----------------------------  ### QC CODE CHECKS UP TO HERE
+#--- STEP 4: ALIGN PHENOTYPE TO METHYLATION MATRIX -----------------------------
 
 # Match phenotypes to methylation matrix columns by normalized sample keys.
 # Remove unmatched samples.
@@ -748,24 +748,33 @@ if (!SKIP_STEP_4 || is.null(studies_loaded)) {
   message("\n[STEP 4/6] Aligning phenotype to methylation matrix...")
 
   for (gse_id in all_gses) {
-    message("  ", gse_id)
+    message("  [", match(gse_id, all_gses), "/", length(all_gses), "] ", gse_id, 
+      " - Aligning samples...", appendLF = FALSE)
 
     # Skip studies with no methylation data
     
     if (is.null(studies[[gse_id]]$meth)) {
-      message("    [!] Skipping (no methylation data)")
+      message(" [SKIPPED - no methylation data]")
       next
     }
 
     ph <- studies[[gse_id]]$pheno
     mat <- studies[[gse_id]]$meth
+    
+    n_pheno_start <- nrow(ph)
+    n_meth_start <- ncol(mat)
 
     aligned <- align_pheno_to_matrix(ph, mat)
     ph2 <- aligned$ph
     mat2 <- aligned$mat
 
-    message("    - Matched: ", ncol(mat2), " samples (from ", 
-            nrow(ph), " phenotype records)")
+    n_matched <- ncol(mat2)
+    
+    if (n_matched == 0) {
+      message(" [WARNING: 0 samples matched - check sample identifiers]")
+    } else {
+      message(" (OK) (", n_matched, "/", n_meth_start, " methylation samples matched)")
+    }
 
     studies[[gse_id]]$pheno <- ph2
     studies[[gse_id]]$meth <- mat2
