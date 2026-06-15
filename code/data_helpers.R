@@ -13,7 +13,7 @@
 #             - Fallback series matrix handling
 #             - Probe filtering and CpG harmonization
 #             - Sample ID alignment between phenotype and methylation data
-#             - Age parsing and curated study-specific age extraction
+#             - Age parsing from phenotype metadata columns
 #             - Missing data imputation and scorcher-ready output formatting
 #
 #  INPUT:   This file does not execute the preprocessing pipeline on its own.
@@ -24,10 +24,7 @@
 #             - GEO study accession IDs (e.g., GSE40279)
 #             - Downloaded GEO series matrix files
 #             - Downloaded supplementary raw files (e.g., IDATs)
-#             - Optional reference files such as:
-#
-#                 * cross_reactive_probes.csv
-#                 * age_rules.csv
+#             - Installed Illumina annotation packages
 #
 #  OUTPUT:  This file does not directly write final processed datasets. 
 #           Its functions return intermediate objects used by the main 
@@ -54,17 +51,15 @@
 #                 - Some helper functions implement pragmatic fallback 
 #                   behavior (e.g., age parsing, series matrix processing).
 #
-#                 - For publication-quality reproduction, study-specific age 
-#                   rules and a documented cross-reactive probe list should 
-#                   be supplied and reviewed explicitly.
+#                 - For publication-quality reproduction, parsed age columns
+#                   should be reviewed against study documentation.
 #
 #             3. Platform harmonization:
 #
-#                 - The intended preprocessing uses CpGs shared across the 
-#                   Illumina 27K and 450K arrays, excluding sex chromosome 
-#                   probes and probes with problematic mappings, so these 
-#                   helpers include functionality for building and applying 
-#                   a fixed common CpG panel.
+#                 - The intended preprocessing uses CpGs shared across the
+#                   Illumina 27K and 450K arrays. The HM450 sesameData manifest
+#                   is used to remove sex chromosome probes and duplicate
+#                   genomic coordinates before the final cross-study intersection.
 #
 #             4. Scope:
 #
@@ -95,6 +90,11 @@
   if (is.null(x) || length(x) == 0) y else x
 }
 
+progress_message <- function(..., appendLF = TRUE) {
+  message("[", format(Sys.time(), "%H:%M:%S"), "] ", ..., appendLF = appendLF)
+  flush.console()
+}
+
 #--- NORMALIZE SAMPLE IDENTIFIERS ----------------------------------------------
 
 # PURPOSE:
@@ -108,8 +108,8 @@
 #   Character vector of normalized sample keys.
 
 sample_key_normalize <- function(x) {
-  
-  x |>
+
+  key <- x |>
     as.character() |>
     basename() |>
     stringr::str_replace("\\.gz$", "") |>
@@ -118,6 +118,10 @@ sample_key_normalize <- function(x) {
     stringr::str_replace("\\s+", "_") |>
     stringr::str_replace_all("[^A-Za-z0-9._-]", "_") |>
     toupper()
+
+  gsm_key <- stringr::str_extract(key, "GSM[0-9]+")
+  key[!is.na(gsm_key)] <- gsm_key[!is.na(gsm_key)]
+  key
 }
 
 #--- CLIP BETA VALUES TO [0,1] -------------------------------------------------
@@ -363,7 +367,7 @@ download_geo_raw <- function(gse_id, dest = DIR_RAW_DOWNLOADS) {
 #   invisible(gse_dir)
 # }
 
-extract_geo_raw <- function(gse_id, src = DIR_RAW_DOWNLOADS, dest = DIR_RAW_ExTRACTED) {
+extract_geo_raw <- function(gse_id, src = DIR_RAW_DOWNLOADS, dest = DIR_RAW_EXTRACTED) {
 
   #--- PURPOSE -----------------------------------------------------------------
   # STEP 2: Extract top-level archives from downloaded files.
@@ -374,7 +378,7 @@ extract_geo_raw <- function(gse_id, src = DIR_RAW_DOWNLOADS, dest = DIR_RAW_ExTR
   # INPUT:
   #   gse_id - GEO Series accession
   #   src    - Source directory where archives were downloaded (DIR_RAW_DOWNLOADS)
-  #   dest   - Destination directory for extracted files (DIR_RAW_ExTRACTED)
+  #   dest   - Destination directory for extracted files (DIR_RAW_EXTRACTED)
   #
   # OUTPUT:
   #   Invisibly returns dest_dir path.
@@ -462,7 +466,7 @@ extract_geo_raw <- function(gse_id, src = DIR_RAW_DOWNLOADS, dest = DIR_RAW_ExTR
 
 #--- ExTRACT NESTED TAR FILES ---------------------------------------------------
 
-extract_nested_tar_files <- function(gse_id, src = DIR_RAW_ExTRACTED, dest = DIR_RAW_TAR) {
+extract_nested_tar_files <- function(gse_id, src = DIR_RAW_EXTRACTED, dest = DIR_RAW_TAR) {
 
   #--- PURPOSE -----------------------------------------------------------------
   # STEP 3: Extract secondary/nested TAR archives (e.g., _RAW.tar).
@@ -472,7 +476,7 @@ extract_nested_tar_files <- function(gse_id, src = DIR_RAW_ExTRACTED, dest = DIR
   #
   # INPUT:
   #   gse_id - GEO Series accession
-  #   src    - Source directory with already-extracted files (DIR_RAW_ExTRACTED)
+  #   src    - Source directory with already-extracted files (DIR_RAW_EXTRACTED)
   #   dest   - Destination directory for nested tar extraction (DIR_RAW_TAR)
   #
   # OUTPUT:
@@ -561,7 +565,7 @@ extract_nested_tar_files <- function(gse_id, src = DIR_RAW_ExTRACTED, dest = DIR
 #--- ExTRACT .IDAT.GZ FILES ---------------------------------------------------
 
 extract_idat_gz_files <- function(gse_id,
-                                  src_dirs = c(DIR_RAW_ExTRACTED, DIR_RAW_TAR),
+                                  src_dirs = c(DIR_RAW_EXTRACTED, DIR_RAW_TAR),
                                   dest = DIR_RAW_IDAT) {
 
   #--- PURPOSE -----------------------------------------------------------------
@@ -760,22 +764,105 @@ normalize_expr_fallback_to_beta <- function(expr) {
   NULL
 }
 
+#--- READ PROCESSED SUPPLEMENTARY BETA MATRICES --------------------------------
+
+read_beta_from_supplementary_matrix <- function(gse_id, src = DIR_RAW_DOWNLOADS) {
+  gse_dir <- fs::path(src, gse_id)
+  if (!dir.exists(gse_dir)) return(NULL)
+
+  candidates <- fs::dir_ls(
+    gse_dir,
+    regexp = "(MatrixProcessed|Beta).*\\.txt(\\.gz)?$",
+    type = "file"
+  )
+
+  if (length(candidates) == 0) return(NULL)
+
+  priority <- dplyr::case_when(
+    stringr::str_detect(basename(candidates), "MatrixProcessed") ~ 1L,
+    stringr::str_detect(basename(candidates), "Normalized") ~ 2L,
+    stringr::str_detect(basename(candidates), "Beta") ~ 3L,
+    TRUE ~ 4L
+  )
+  candidates <- candidates[order(priority, basename(candidates))]
+
+  for (path in candidates) {
+    beta <- tryCatch({
+      progress_message("Reading supplementary matrix: ", path)
+      t_start <- Sys.time()
+      dt <- data.table::fread(
+        path,
+        skip = "ID_REF",
+        data.table = FALSE,
+        check.names = FALSE,
+        showProgress = FALSE
+      )
+      progress_message(
+        "Finished supplementary matrix read: ", basename(path),
+        " (", nrow(dt), " rows x ", ncol(dt), " cols, ",
+        round(as.numeric(difftime(Sys.time(), t_start, units = "secs")), 1),
+        " sec)"
+      )
+
+      if (nrow(dt) == 0 || ncol(dt) < 2) {
+        NULL
+      } else {
+        probe_id <- as.character(dt[[1]])
+        value_idx <- seq_len(ncol(dt))[-1]
+        value_names <- names(dt)[value_idx]
+        beta_keep <- !stringr::str_detect(
+          tolower(value_names),
+          "detect|pval|p\\.val|pvalue"
+        )
+        beta_idx <- value_idx[beta_keep]
+
+        if (length(beta_idx) == 0) {
+          NULL
+        } else {
+          mat <- as.matrix(dt[, beta_idx, drop = FALSE])
+          storage.mode(mat) <- "numeric"
+          rownames(mat) <- probe_id
+          colnames(mat) <- value_names[beta_keep]
+
+          normalize_expr_fallback_to_beta(mat)
+        }
+      }
+    }, error = function(e) {
+      message("supplementary matrix read failed for ", basename(path), ": ",
+              conditionMessage(e))
+      NULL
+    })
+
+    if (!is.null(beta)) {
+      message(" (supplementary matrix: ", basename(path), ")", appendLF = FALSE)
+      return(beta)
+    }
+  }
+
+  NULL
+}
+
 #--- PARSE AGE VALUES FROM FREE TExT -------------------------------------------
 
 extract_age_from_string <- function(x) {
   x <- tolower(as.character(x))
   
   out <- rep(NA_real_, length(x))
+
+  newborn_idx <- stringr::str_detect(x, "\\b(newborn|neonate|neonatal)\\b")
+  out[newborn_idx] <- 0
   
   # years / yo / y / age:
   pat_years <- c(
+    "age\\s*(at)?\\s*(recruitment|diagnosis|draw|sample|bl)?\\s*(\\([^)]*\\))?\\s*[:=]?\\s*([0-9]+\\.?[0-9]*)",
     "age[^0-9]{0,10}([0-9]+\\.?[0-9]*)",
     "([0-9]+\\.?[0-9]*)\\s*(years|year|yrs|yr|yo|y/o|y\\.o\\.)",
     "([0-9]+\\.?[0-9]*)\\s*y\\b"
   )
   
   for (pat in pat_years) {
-    hit <- stringr::str_match(x, pat)[, 2]
+    m <- stringr::str_match(x, pat)
+    hit <- m[, ncol(m)]
     val <- suppressWarnings(as.numeric(hit))
     idx <- is.na(out) & !is.na(val)
     out[idx] <- val[idx]
@@ -817,6 +904,54 @@ extract_age_from_string <- function(x) {
   out
 }
 
+is_age_metadata_column <- function(cols) {
+  cols <- tolower(as.character(cols))
+
+  stringr::str_detect(
+    cols,
+    "(^age)|([^a-z]age([^a-z]|$))|ageat|age_at|age at|agebl|donor_age|chronological|gestational"
+  )
+}
+
+infer_age_unit_from_column <- function(col) {
+  col <- tolower(as.character(col))
+
+  if (stringr::str_detect(col, "month|\\bmo\\b|_mo\\b|months")) {
+    return("months")
+  }
+
+  if (stringr::str_detect(col, "week|\\bwk\\b|_wk\\b|weeks")) {
+    return("weeks")
+  }
+
+  if (stringr::str_detect(col, "day|days")) {
+    return("days")
+  }
+
+  if (stringr::str_detect(col, "gestational")) {
+    return("weeks")
+  }
+
+  "years"
+}
+
+parse_age_column <- function(x, col) {
+  unit <- infer_age_unit_from_column(col)
+
+  if (is.numeric(x)) {
+    return(convert_age_units_to_years(suppressWarnings(as.numeric(x)), unit))
+  }
+
+  parsed <- extract_age_from_string(x)
+  plain_numeric <- suppressWarnings(as.numeric(
+    stringr::str_replace(as.character(x), "^\\s*[<>]=?\\s*", "")
+  ))
+  idx <- is.na(parsed) & !is.na(plain_numeric)
+  parsed[idx] <- convert_age_units_to_years(plain_numeric[idx], unit)
+
+  parsed
+}
+
 extract_age_robust <- function(ph) {
 
   #--- PURPOSE -----------------------------------------------------------------
@@ -831,71 +966,81 @@ extract_age_robust <- function(ph) {
   #   be parsed. Integer ages are shifted by +0.5 to match reference pipeline.
   #
   # NOTES:
-  #   - Prioritizes columns with age-like names (e.g., "age", "donor_age")
-  #   - Fallback: searches all character/factor columns for age patterns
+  #   - Prioritizes direct age-like columns present in each study
+  #     (e.g., "age", "donor_age", "age_months")
+  #   - Fallback: searches other character/factor columns for age patterns
   #   - Supports multiple formats: "25 years", "25y", "25 yo", "300 months", etc.
-  #   - For study-specific age extraction, use extract_age() with age_rules
+  #   - Plain numeric strings in age-like columns are treated as years unless
+  #     the column name indicates months, weeks, or days
 
-  char_cols <- names(ph)[vapply(ph, function(z) is.character(z) || is.factor(z), logical(1))]
+  if (nrow(ph) == 0) return(numeric())
 
-  # prioritize obvious age-like columns first
-  priority_cols <- char_cols[stringr::str_detect(tolower(char_cols), "age|gestational|donor_age|chronological")]
-  other_cols <- setdiff(char_cols, priority_cols)
-  ordered_cols <- c(priority_cols, other_cols)
+  age <- rep(NA_real_, nrow(ph))
 
-  if (length(ordered_cols) == 0) return(rep(NA_real_, nrow(ph)))
+  numeric_cols <- names(ph)[vapply(ph, is.numeric, logical(1))]
+  numeric_age_cols <- numeric_cols[is_age_metadata_column(numeric_cols)]
 
-  parsed_list <- lapply(ordered_cols, function(col) {
-    extract_age_from_string(ph[[col]])
-  })
-
-  age <- parsed_list[[1]]
-  if (length(parsed_list) > 1) {
-    for (j in 2:length(parsed_list)) {
-      idx <- is.na(age) & !is.na(parsed_list[[j]])
-      age[idx] <- parsed_list[[j]][idx]
-    }
+  for (col in numeric_age_cols) {
+    cur <- parse_age_column(ph[[col]], col)
+    idx <- is.na(age) & !is.na(cur)
+    age[idx] <- cur[idx]
   }
 
-  # Also try numeric columns with age-like names
-  num_cols <- names(ph)[vapply(ph, is.numeric, logical(1))]
-  num_age_cols <- num_cols[stringr::str_detect(tolower(num_cols), "age|gestational|donor_age|chronological")]
-  if (length(num_age_cols) > 0) {
-    for (col in num_age_cols) {
-      val <- suppressWarnings(as.numeric(ph[[col]]))
-      idx <- is.na(age) & !is.na(val)
-      age[idx] <- val[idx]
-    }
+  char_cols <- names(ph)[vapply(ph, function(z) is.character(z) || is.factor(z), logical(1))]
+  char_age_cols <- char_cols[is_age_metadata_column(char_cols)]
+
+  for (col in char_age_cols) {
+    cur <- parse_age_column(ph[[col]], col)
+    idx <- is.na(age) & !is.na(cur)
+    age[idx] <- cur[idx]
+  }
+
+  fallback_cols <- setdiff(char_cols, char_age_cols)
+
+  for (col in fallback_cols) {
+    cur <- extract_age_from_string(ph[[col]])
+    idx <- is.na(age) & !is.na(cur)
+    age[idx] <- cur[idx]
   }
 
   add_half_if_integer(age)
 }
 
-#--- LOAD CURATED AGE PARSING RULES --------------------------------------------
+#--- INFER CONTROL / CASE STATUS FROM PHENOTYPE METADATA -----------------------
 
-load_age_rules <- function(path = AGE_RULES_FILE) {
-  
-  if (!file.exists(path)) {
-    warning("Age rules file not found at: ", path)
-    return(tibble::tibble(
-      gse = character(),
-      field = character(),
-      parse_type = character(),
-      unit = character(),
-      pattern = character(),
-      notes = character()
-    ))
+infer_control_status <- function(ph) {
+
+  if (nrow(ph) == 0) return(logical())
+
+  cols <- names(ph)[vapply(ph, function(z) is.character(z) || is.factor(z), logical(1))]
+  cols <- cols[stringr::str_detect(
+    tolower(cols),
+    "case|control|disease|diagnos|group|status|hiv|ards|sample type|used_in_analysis"
+  )]
+
+  status <- rep(NA, nrow(ph))
+
+  for (col in cols) {
+    x <- tolower(as.character(ph[[col]]))
+    x <- stringr::str_squish(x)
+
+    case_hit <- stringr::str_detect(
+      x,
+      "case|patient|disease|diagnos|cancer|tumou?r|carcinoma|multiple sclerosis|\\bms\\b|\\bibd\\b|crohn|colitis|arthritis|hiv\\s*positive|\\bhiv\\s*1\\b|ards|pneumonia|sepsis|affected"
+    )
+    control_hit <- stringr::str_detect(
+      x,
+      "control|healthy|normal|unaffected|non[- ]?case|hiv\\s*negative|\\bhiv\\s*0\\b|no disease|no diagnosis|none"
+    )
+
+    idx <- is.na(status) & control_hit
+    status[idx] <- TRUE
+
+    idx <- is.na(status) & case_hit
+    status[idx] <- FALSE
   }
 
-  readr::read_csv(path, show_col_types = FALSE) |>
-    dplyr::mutate(
-      gse = as.character(gse),
-      field = as.character(field),
-      parse_type = as.character(parse_type),
-      unit = as.character(unit),
-      pattern = as.character(pattern),
-      notes = as.character(notes)
-    )
+  status
 }
 
 #--- CONVERT AGE UNITS TO YEARS ------------------------------------------------
@@ -904,264 +1049,86 @@ convert_age_units_to_years <- function(x, unit) {
   
   unit <- tolower(unit %||% "years")
 
-  dplyr::case_when(
-    unit %in% c("year", "years", "yr", "yrs") ~ x,
-    unit %in% c("month", "months", "mo", "mos") ~ x / 12,
-    unit %in% c("week", "weeks", "wk", "wks") ~ x / 52.25,
-    unit %in% c("day", "days") ~ x / 365.25,
-    TRUE ~ x
-  )
-}
-
-#--- PARSE AGE FROM ONE RULE ---------------------------------------------------
-
-parse_age_by_rule <- function(ph, rule_row) {
-  
-  field <- rule_row$field
-  parse_type <- rule_row$parse_type
-  unit <- rule_row$unit
-  pattern <- rule_row$pattern
-
-  if (!field %in% names(ph)) {
-    return(rep(NA_real_, nrow(ph)))
+  if (unit %in% c("year", "years", "yr", "yrs")) {
+    return(x)
   }
 
-  x <- ph[[field]]
-
-  out <- switch(
-    parse_type,
-
-    numeric_column = {
-      suppressWarnings(as.numeric(x))
-    },
-
-    regex_numeric = {
-      hit <- stringr::str_match(as.character(x), pattern)[, 2]
-      suppressWarnings(as.numeric(hit))
-    },
-
-    title_regex = {
-      hit <- stringr::str_match(as.character(x), pattern)[, 2]
-      suppressWarnings(as.numeric(hit))
-    },
-
-    characteristics_regex = {
-      hit <- stringr::str_match(as.character(x), pattern)[, 2]
-      suppressWarnings(as.numeric(hit))
-    },
-
-    {
-      warning("Unknown parse_type: ", parse_type)
-      rep(NA_real_, nrow(ph))
-    }
-  )
-
-  convert_age_units_to_years(out, unit = unit)
-}
-
-#--- ExTRACT AGE USING CURATED RULES -------------------------------------------
-
-extract_age_from_rules <- function(ph, gse_id, age_rules) {
-  
-  rules_gse <- age_rules |>
-    dplyr::filter(gse == gse_id)
-
-  if (nrow(rules_gse) == 0) {
-    return(rep(NA_real_, nrow(ph)))
+  if (unit %in% c("month", "months", "mo", "mos")) {
+    return(x / 12)
   }
 
-  parsed <- rep(NA_real_, nrow(ph))
-
-  for (i in seq_len(nrow(rules_gse))) {
-    cur <- parse_age_by_rule(ph, rules_gse[i, , drop = FALSE])
-    idx <- is.na(parsed) & !is.na(cur)
-    parsed[idx] <- cur[idx]
+  if (unit %in% c("week", "weeks", "wk", "wks")) {
+    return(x / 52.25)
   }
 
-  parsed
-}
-
-#--- FALLBACK AGE ExTRACTION ---------------------------------------------------
-
-extract_age_fallback <- function(ph) {
-  
-  char_cols <- names(ph)[vapply(
-    ph,
-    function(z) is.character(z) || is.factor(z),
-    logical(1)
-  )]
-
-  priority_cols <- char_cols[stringr::str_detect(
-    tolower(char_cols),
-    "age|gestational|donor_age|chronological|characteristics|title"
-  )]
-
-  other_cols <- setdiff(char_cols, priority_cols)
-  ordered_cols <- c(priority_cols, other_cols)
-
-  if (length(ordered_cols) == 0) return(rep(NA_real_, nrow(ph)))
-
-  age <- rep(NA_real_, nrow(ph))
-
-  for (col in ordered_cols) {
-    cur <- extract_age_from_string(ph[[col]])
-    idx <- is.na(age) & !is.na(cur)
-    age[idx] <- cur[idx]
+  if (unit %in% c("day", "days")) {
+    return(x / 365.25)
   }
 
-  num_cols <- names(ph)[vapply(ph, is.numeric, logical(1))]
-  num_age_cols <- num_cols[stringr::str_detect(
-    tolower(num_cols),
-    "age|gestational|donor_age|chronological"
-  )]
-
-  for (col in num_age_cols) {
-    cur <- suppressWarnings(as.numeric(ph[[col]]))
-    idx <- is.na(age) & !is.na(cur)
-    age[idx] <- cur[idx]
-  }
-
-  age
+  x
 }
 
-#--- MAIN AGE ExTRACTION WRAPPER -----------------------------------------------
+#--- LOAD SESAME MANIFESTS FOR 27K / 450K ARRAYS -------------------------------
 
-extract_age <- function(ph, gse_id, age_rules) {
-  
-  age_rule <- extract_age_from_rules(ph, gse_id, age_rules)
-  age_fallback <- extract_age_fallback(ph)
-
-  age <- ifelse(!is.na(age_rule), age_rule, age_fallback)
-  add_half_if_integer(age)
-}
-
-#--- LOAD ILLUMINA ANNOTATION FOR 27K / 450K ARRAYS ----------------------------
-
-get_27k_annotation <- function() {
-  
-  ann <- minfi::getAnnotation(IlluminaHumanMethylation27kanno.ilmn12.hg19)
+get_sesame_manifest <- function(platform) {
+  gr <- sesameData::sesameData_getManifestGRanges(platform)
 
   tibble::tibble(
-    probe_id = rownames(ann),
-    chr = as.character(ann$chr)
+    probe_id = names(gr),
+    chr = as.character(GenomeInfoDb::seqnames(gr)),
+    pos = GenomicRanges::start(gr)
   ) |>
+    dplyr::filter(!is.na(probe_id), nzchar(probe_id)) |>
     dplyr::distinct()
 }
 
-get_450k_annotation <- function() {
+normalize_chr <- function(chr) {
+  chr |>
+    as.character() |>
+    toupper() |>
+    stringr::str_replace("^CHR", "")
+}
+
+is_autosomal_chr <- function(chr) {
+  normalize_chr(chr) %in% as.character(seq_len(22))
+}
+
+#--- BUILD AUTOSOMAL CPG PANEL FROM SESAME HM450 MANIFEST ----------------------
+
+autosomal_cpg_panel_hm450 <- function(drop_sex = TRUE,
+                                      drop_ambiguous = TRUE,
+                                      save_manifest = TRUE) {
   
-  ann <- minfi::getAnnotation(IlluminaHumanMethylation450kanno.ilmn12.hg19)
-
-  tibble::tibble(
-    probe_id = rownames(ann),
-    chr = as.character(ann$chr)
-  ) |>
-    dplyr::distinct()
-}
-
-#--- LOAD CROSS-REACTIVE / MULTI-MAPPING PROBE IDS -----------------------------
-
-load_cross_reactive_probes <- function(path = CROSS_REACTIVE_FILE) {
-  
-  if (!file.exists(path)) {
-    message("No cross-reactive probe file found at: ", path)
-    return(character())
-  }
-
-  x <- readr::read_csv(path, show_col_types = FALSE)
-
-  if (ncol(x) == 0) return(character())
-
-  unique(as.character(x[[1]]))
-}
-
-drop_non_autosomal_probes <- function(mat) {
-
-  #--- PURPOSE -----------------------------------------------------------------
-  # Remove probes on sex chromosomes (x, Y) if annotation available.
-  # This is Step 3b of the preprocessing pipeline.
-  #
-  # INPUT:
-  #   mat - Numeric matrix (probes x samples) with rownames = probe IDs
-  #
-  # OUTPUT:
-  #   Currently returns input unchanged (stub function)
-  #
-  # NOTES:
-  #   - This function is a placeholder for future annotation-based filtering
-  #   - When chromosome annotation becomes available, will filter by chr annotation
-  #   - For now, the global CpG intersection handles most filtering implicitly
-
-  # Conservative rule:
-  # If we later add an annotation table of probe->chr, replace this stub
-  # with exact chromosome-based filtering.
-  #
-  # For now we leave probe set unchanged here and rely on global intersection
-  # unless we provide an annotation-based filter externally.
-  mat
-}
-
-drop_cross_reactive_probes <- function(mat, cross_reactive = character()) {
-
-  #--- PURPOSE -----------------------------------------------------------------
-  # Remove probes with cross-reactive or multi-mapping issues.
-  # This is Step 3c of the preprocessing pipeline.
-  #
-  # INPUT:
-  #   mat - Numeric matrix (probes x samples) with rownames = probe IDs
-  #   cross_reactive - Character vector of probe IDs to remove
-  #
-  # OUTPUT:
-  #   Matrix with problematic probes removed. If cross_reactive is empty,
-  #   returns input unchanged.
-  #
-  # NOTES:
-  #   - cross_reactive is typically loaded from data/reference/cross_reactive_probes.csv
-  #   - These probes have ambiguous mappings or cross-hybridize in methylation assays
-  #   - Removing them improves specificity of downstream epigenetic clock predictions
-
-  if (length(cross_reactive) == 0) return(mat)
-  keep <- setdiff(rownames(mat), cross_reactive)
-  mat[keep, , drop = FALSE]
-}
-
-#--- BUILD ExACT COMMON CPG SET ACROSS 27K AND 450K ----------------------------
-
-common_cpgs_27k_450k <- function(drop_sex = TRUE,
-                                 drop_cross_reactive = TRUE,
-                                 cross_reactive_file = CROSS_REACTIVE_FILE,
-                                 save_manifest = TRUE) {
-  
-  ann27 <- get_27k_annotation()
-  ann450 <- get_450k_annotation()
-
-  common <- dplyr::inner_join(
-    ann27 |> dplyr::rename(chr_27k = chr),
-    ann450 |> dplyr::rename(chr_450k = chr),
-    by = "probe_id"
-  ) |>
-    dplyr::filter(!is.na(chr_27k), !is.na(chr_450k)) |>
-    dplyr::filter(chr_27k == chr_450k) |>
-    dplyr::mutate(chr = chr_27k)
+  panel <- get_sesame_manifest("HM450") |>
+    dplyr::mutate(
+      chr = normalize_chr(chr)
+    ) |>
+    dplyr::filter(!is.na(chr), !is.na(pos))
 
   if (drop_sex) {
-    common <- common |>
-      dplyr::filter(!toupper(chr) %in% c("CHRx", "x", "CHRY", "Y"))
+    panel <- panel |>
+      dplyr::filter(is_autosomal_chr(chr))
   }
 
-  if (drop_cross_reactive) {
-    xr <- load_cross_reactive_probes(cross_reactive_file)
-    if (length(xr) > 0) {
-      common <- common |>
-        dplyr::filter(!(probe_id %in% xr))
-    }
+  if (drop_ambiguous) {
+    panel <- panel |>
+      dplyr::add_count(chr, pos, name = "n_probes_at_coordinate") |>
+      dplyr::filter(n_probes_at_coordinate == 1)
+  } else {
+    panel <- panel |>
+      dplyr::mutate(n_probes_at_coordinate = NA_integer_)
   }
 
-  common_ids <- sort(unique(common$probe_id))
+  panel_ids <- sort(unique(panel$probe_id))
 
   if (save_manifest) {
-    manifest <- common |>
-      dplyr::select(probe_id, chr) |>
+    manifest <- panel |>
+      dplyr::select(
+        probe_id,
+        chr,
+        pos,
+        n_probes_at_coordinate
+      ) |>
       dplyr::arrange(probe_id)
 
     readr::write_csv(
@@ -1174,7 +1141,7 @@ common_cpgs_27k_450k <- function(drop_sex = TRUE,
     )
   }
 
-  common_ids
+  panel_ids
 }
 
 #--- RESTRICT MATRIx TO COMMON CPGS --------------------------------------------
@@ -1182,6 +1149,13 @@ common_cpgs_27k_450k <- function(drop_sex = TRUE,
 restrict_to_common_cpgs <- function(mat, common_cpgs) {
   
   if (is.null(mat)) return(NULL)
+
+  if (is.null(dim(mat)) || length(dim(mat)) != 2) {
+    warning("Methylation object is not a 2D matrix; cannot restrict to CpGs.")
+    return(NULL)
+  }
+
+  mat <- as.matrix(mat)
 
   rn <- rownames(mat)
 
@@ -1268,23 +1242,40 @@ build_pheno_sample_keys <- function(ph) {
 #   - Validates that ph and mat are perfectly aligned after matching
 
 align_pheno_to_matrix <- function(ph, mat) {
-  # Robust null/empty checks - handle all edge cases
-  tryCatch({
-    if (is.null(mat) || is.null(ph)) {
-      return(list(ph = ph[0, , drop = FALSE], mat = mat[, 0, drop = FALSE]))
+  empty_alignment <- function(ph, mat) {
+    ph0 <- if (is.null(ph)) {
+      data.frame()
+    } else {
+      as.data.frame(ph)[0, , drop = FALSE]
     }
-    
-    mat_cols <- ncol(mat)
-    ph_rows <- nrow(ph)
-    
-    # Check for NA, NULL, or 0
-    if (is.na(mat_cols) || is.na(ph_rows) || mat_cols == 0 || ph_rows == 0) {
-      return(list(ph = ph[0, , drop = FALSE], mat = mat[, 0, drop = FALSE]))
+
+    mat0 <- if (!is.null(mat) && !is.null(dim(mat)) && length(dim(mat)) == 2) {
+      as.matrix(mat)[, 0, drop = FALSE]
+    } else {
+      matrix(nrow = 0, ncol = 0)
     }
-  }, error = function(e) {
-    # If matrix/phenotype structure is malformed, return empty
-    return(list(ph = data.frame(), mat = matrix(nrow=0, ncol=0)))
-  })
+
+    list(ph = ph0, mat = mat0)
+  }
+
+  if (is.null(mat) || is.null(ph)) {
+    return(empty_alignment(ph, mat))
+  }
+
+  if (is.null(dim(mat)) || length(dim(mat)) != 2) {
+    message("    [DEBUG] Methylation object is not a 2D matrix; skipping alignment.")
+    return(empty_alignment(ph, mat))
+  }
+
+  mat <- as.matrix(mat)
+  ph <- as.data.frame(ph)
+
+  mat_cols <- ncol(mat)
+  ph_rows <- nrow(ph)
+
+  if (is.na(mat_cols) || is.na(ph_rows) || mat_cols == 0 || ph_rows == 0) {
+    return(empty_alignment(ph, mat))
+  }
 
   ph <- ph |> dplyr::mutate(sample_key = build_pheno_sample_keys(ph))
 
@@ -1302,7 +1293,28 @@ align_pheno_to_matrix <- function(ph, mat) {
     message("      Matrix column names sample: ", paste(head(colnames(mat), 3), collapse = ", "))
     message("      Phenotype sample keys sample: ", paste(head(ph$sample_key, 3), collapse = ", "))
     message("      This likely means phenotype and matrix use different sample identifiers.")
-    return(list(ph = ph[0, , drop = FALSE], mat = mat[, 0, drop = FALSE]))
+
+    sample_num <- suppressWarnings(as.integer(stringr::str_match(
+      colnames(mat),
+      stringr::regex("^sample[ ._-]*([0-9]+)$", ignore_case = TRUE)
+    )[, 2]))
+
+    if (length(sample_num) == ncol(mat) &&
+        all(!is.na(sample_num)) &&
+        setequal(sample_num, seq_len(ncol(mat))) &&
+        ncol(mat) == nrow(ph)) {
+      message("      Falling back to ordinal Sample N matching.")
+
+      ord <- order(sample_num)
+      mat2 <- mat[, ord, drop = FALSE]
+      ph2 <- ph[seq_len(ncol(mat2)), , drop = FALSE]
+      stable_ids <- if ("geo_accession" %in% names(ph2)) ph2$geo_accession else ph2$sample_key
+      colnames(mat2) <- as.character(stable_ids)
+
+      return(list(ph = ph2, mat = mat2))
+    }
+
+    return(empty_alignment(ph, mat))
   }
   
   mat2 <- mat[, keep_cols, drop = FALSE]
@@ -1381,7 +1393,9 @@ align_pheno_to_matrix <- function(ph, mat) {
 #   - Applies beta value clipping to ensure values stay in [0, 1]
 #   - If IDAT processing fails, returns NULL (triggering fallback to series matrix)
 
-read_beta_from_idats <- function(gse_dir) {
+read_beta_from_idats <- function(gse_dir, force_samplewise = FALSE) {
+  t0 <- Sys.time()
+  progress_message("      IDAT scan started: ", gse_dir)
 
   # First, decompress any .idat.gz files to .idat
   gz_idats <- fs::dir_ls(
@@ -1391,11 +1405,14 @@ read_beta_from_idats <- function(gse_dir) {
     type = "file"
   )
 
+  progress_message("      Found ", length(gz_idats), " compressed IDAT file(s)")
+
   if (length(gz_idats) > 0) {
     for (gz_file in gz_idats) {
       uncompressed_file <- stringr::str_replace(gz_file, "\\.gz$", "")
       # Only decompress if uncompressed file doesn't already exist
       if (!file.exists(uncompressed_file)) {
+        progress_message("      Decompressing ", basename(gz_file))
         tryCatch({
           R.utils::gunzip(gz_file, destname = uncompressed_file, remove = FALSE)
         }, error = function(e) {
@@ -1405,17 +1422,88 @@ read_beta_from_idats <- function(gse_dir) {
     }
   }
 
+  progress_message("      Finding complete Red/Green IDAT pairs")
   prefixes <- find_idat_prefixes(gse_dir)
+  progress_message("      Found ", length(prefixes), " complete IDAT pair(s)")
   if (length(prefixes) == 0) return(NULL)
 
-  # Disable parallelization to ensure sesame can access cached data
-  tryCatch({
-    BiocParallel::register(BiocParallel::SerialParam())
-    beta <- sesame::openSesame(prefixes, func = sesame::getBetas)
-  }, error = function(e) {
-    message("sesame preprocessing failed in ", gse_dir, ": ", conditionMessage(e))
-    return(NULL)
-  })
+  # Disable parallelization to ensure sesame can access cached data.
+  if (force_samplewise) {
+    progress_message("      Skipping batch IDAT preprocessing; using sample-by-sample recovery")
+    beta <- NULL
+  } else {
+    progress_message("      Starting batch sesame::openSesame() for ", length(prefixes), " sample(s)")
+    beta <- tryCatch({
+      BiocParallel::register(BiocParallel::SerialParam())
+      sesame::openSesame(prefixes, func = sesame::getBetas)
+    }, error = function(e) {
+      message("sesame preprocessing failed in ", gse_dir, ": ", conditionMessage(e))
+      NULL
+    })
+    progress_message(
+      "      Batch IDAT preprocessing finished in ",
+      round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 2),
+      " min"
+    )
+  }
+
+  if (is.null(beta) && length(prefixes) > 1) {
+    message("  Retrying IDAT preprocessing sample-by-sample...")
+
+    beta_list <- list()
+    failed_prefixes <- character()
+
+    for (i in seq_along(prefixes)) {
+      prefix <- prefixes[[i]]
+
+      if (i == 1 || i %% 25 == 0 || i == length(prefixes)) {
+        progress_message(
+          "  IDAT recovery progress: ", i, "/", length(prefixes),
+          " (", basename(prefix), ")"
+        )
+      }
+
+      cur <- tryCatch({
+        sesame::openSesame(prefix, func = sesame::getBetas)
+      }, error = function(e) {
+        failed_prefixes <<- c(failed_prefixes, basename(prefix))
+        NULL
+      })
+
+      if (is.null(cur)) next
+
+      if (is.null(dim(cur))) {
+        cur_names <- names(cur)
+        cur <- matrix(cur, ncol = 1)
+        rownames(cur) <- cur_names
+        colnames(cur) <- basename(prefix)
+      } else {
+        cur <- as.matrix(cur)
+      }
+
+      storage.mode(cur) <- "numeric"
+      beta_list[[basename(prefix)]] <- cur
+    }
+
+    progress_message(
+      "      Sample-by-sample IDAT recovery finished in ",
+      round(as.numeric(difftime(Sys.time(), t0, units = "mins")), 2),
+      " min; recovered ", length(beta_list), "/", length(prefixes), " sample(s)"
+    )
+
+    if (length(failed_prefixes) > 0) {
+      message("  Skipped ", length(failed_prefixes), " unreadable IDAT pair(s): ",
+              paste(head(failed_prefixes, 5), collapse = ", "),
+              if (length(failed_prefixes) > 5) ", ..." else "")
+    }
+
+    if (length(beta_list) > 0) {
+      common_probes <- Reduce(intersect, lapply(beta_list, rownames))
+      beta <- do.call(cbind, lapply(beta_list, function(x) {
+        x[common_probes, , drop = FALSE]
+      }))
+    }
+  }
 
   if (is.null(beta)) return(NULL)
 
@@ -1565,19 +1653,25 @@ safe_checkpoint_read <- function(checkpoint_path) {
     return(NULL)
   }
   
+  size_mb <- file.size(checkpoint_path) / 1024^2
+  progress_message(
+    "Reading checkpoint: ", checkpoint_path,
+    " (", round(size_mb, 1), " MB)"
+  )
+  t_start <- Sys.time()
+
   tryCatch({
-    qs2::qs_read(checkpoint_path)
+    out <- qs2::qs_read(checkpoint_path)
+    progress_message(
+      "Finished checkpoint read: ", checkpoint_path,
+      " (", round(as.numeric(difftime(Sys.time(), t_start, units = "secs")), 1),
+      " sec)"
+    )
+    out
   }, error = function(e) {
     warning("\n x Corrupted checkpoint at: ", checkpoint_path,
             "\n  Error: ", conditionMessage(e),
-            "\n  Attempting recovery by deleting and restarting step...")
-    
-    tryCatch({
-      unlink(checkpoint_path)
-      message("   + Corrupted file deleted")
-    }, error = function(e2) {
-      message("   x Could not delete corrupted file: ", conditionMessage(e2))
-    })
+            "\n  Leaving checkpoint in place and returning NULL.")
     
     return(NULL)
   })
@@ -1585,6 +1679,9 @@ safe_checkpoint_read <- function(checkpoint_path) {
 
 safe_checkpoint_save <- function(object, checkpoint_path) {
   
+  progress_message("Saving checkpoint: ", checkpoint_path)
+  t_start <- Sys.time()
+
   tryCatch({
     qs2::qs_save(object, checkpoint_path)
     
@@ -1593,6 +1690,14 @@ safe_checkpoint_save <- function(object, checkpoint_path) {
       stop("Checkpoint file not created at: ", checkpoint_path,
            " (Check file permissions)")
     }
+
+    size_mb <- file.size(checkpoint_path) / 1024^2
+    progress_message(
+      "Finished checkpoint save: ", checkpoint_path,
+      " (", round(size_mb, 1), " MB, ",
+      round(as.numeric(difftime(Sys.time(), t_start, units = "secs")), 1),
+      " sec)"
+    )
     
     invisible(NULL)
     
@@ -1606,4 +1711,3 @@ safe_checkpoint_save <- function(object, checkpoint_path) {
          "  Please check and try again.")
   })
 }
-

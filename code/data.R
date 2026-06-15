@@ -30,7 +30,7 @@
 #             - Raw IDAT discovery and preprocessing
 #             - Probe filtering and CpG harmonization
 #             - Phenotype-methylation alignment
-#             - Age extraction and rule-based parsing
+#             - Age extraction from phenotype metadata columns
 #             - Matrix combination and imputation
 #
 #           The helper file must be available in the project directory
@@ -54,8 +54,6 @@
 #
 #               data/reference/
 #
-#             - cross_reactive_probes.csv
-#             - age_rules.csv
 #
 #  OUTPUT:  Preprocessed phenotype and methylation datasets stored in:
 #
@@ -88,16 +86,16 @@
 #
 #             2. Probe harmonization
 #
-#                 - The feature space is restricted to CpGs shared across
-#                   Illumina 27K and 450K arrays.
-#                 - Sex chromosome probes and cross-reactive probes are removed.
+#                 - A sesameData HM450 manifest is used to remove sex chromosome
+#                   probes and duplicate-coordinate probes before the final
+#                   cross-study CpG intersection.
 #
 #             3. Age parsing
 #
-#                 - Age is extracted from GEO phenotype metadata using curated
-#                   study-specific rules when available.
-#                 - A heuristic parser provides a fallback when no rule is
-#                   defined.
+#                 - Age is extracted directly from age-like GEO phenotype
+#                   metadata columns when present.
+#                 - The parser falls back to other phenotype text fields when
+#                   age-like column names are unavailable.
 #                 - Integer ages are shifted by +0.5 years to match the
 #                   convention used in the reference preprocessing pipeline.
 #
@@ -184,7 +182,7 @@ for (dir in required_dirs) {
 #  data/raw/idat/           - Final .idat files (from .idat.gz or nested tars)
 #  data/intermediate/       - Processing checkpoints
 #  data/processed/          - Final outputs
-#  data/reference/          - Reference files (cross_reactive_probes, age_rules)
+#  data/reference/          - Reserved for optional local reference files
 
 DIR_GEO_PHENO      <- "data/geoquery"
 DIR_RAW_DOWNLOADS  <- "data/raw/downloads"
@@ -204,32 +202,9 @@ fs::dir_create(DIR_INTER,         recurse = TRUE)
 fs::dir_create(DIR_OUT,           recurse = TRUE)
 fs::dir_create(DIR_REF,           recurse = TRUE)
 
-CROSS_REACTIVE_FILE <- fs::path(DIR_REF, "cross_reactive_probes.csv")
-AGE_RULES_FILE      <- fs::path(DIR_REF, "age_rules.csv")
+#--- 4. REFERENCE FILE VALIDATION ----------------------------------------------
 
-#--- 4. REFERENCE FILE VALIDATION ---------------------------------------------- ### NEED TO IMPLEMENT
-
-message(" + Checking reference files...")
-
-ref_files <- list(
-  age_rules = "data/reference/age_rules.csv",
-  cross_reactive = "data/reference/cross_reactive_probes.csv"
-)
-
-ref_status <- list()
-
-for (name in names(ref_files)) {
-  path <- ref_files[[name]]
-  exists <- file.exists(path)
-  ref_status[[name]] <- exists
-
-  if (exists) {
-    size <- file.size(path) / 1024
-    message("   + ", basename(path), " (", round(size, 0), " KB)")
-  } else {
-    message("   x ", basename(path), " (MISSING - Optional but recommended)")
-  }
-}
+message(" + Probe filtering will use sesameData manifests")
 
 #--- 5. DISK SPACE CHECK -------------------------------------------------------
 
@@ -250,31 +225,7 @@ if (!disk_check) {
 
 #--- 6. REFERENCE FILE VALIDATION FOR DATA QUALITY -----------------------------
 
-message(" + Validating reference files required for accuracy...")
-
-missing_refs <- c()
-
-if (!file.exists(CROSS_REACTIVE_FILE)) {
-  missing_refs <- c(missing_refs, "cross_reactive_probes.csv")
-  message("   x", CROSS_REACTIVE_FILE, " (will use all probes)")
-} else {
-  message("   + cross_reactive_probes.csv found")
-}
-
-if (!file.exists(AGE_RULES_FILE)) {
-  missing_refs <- c(missing_refs, "age_rules.csv")
-  message("   x ", AGE_RULES_FILE, " (will use heuristic age parsing)")
-} else {
-  message("   + age_rules.csv found")
-}
-
-if (length(missing_refs) > 0) {
-  warning("\n x WARNING: Missing reference files:\n",
-          "  - ", paste(missing_refs, collapse="\n  - "), "\n",
-          "\n  For better results, provide:\n",
-          "    data/reference/age_rules.csv\n",
-          "    data/reference/cross_reactive_probes.csv\n")
-}
+message(" + No external probe reference CSVs are required")
 
 message("\n + Project setup checks complete\n")
 
@@ -323,10 +274,9 @@ bioc_pkgs <- c(
   "Biobase",
   "sesame",
   "sesameData",
-  "minfi",
-  "BiocParallel",
-  "IlluminaHumanMethylation27kanno.ilmn12.hg19",
-  "IlluminaHumanMethylation450kanno.ilmn12.hg19"
+  "GenomeInfoDb",
+  "GenomicRanges",
+  "BiocParallel"
 )
 
 missing_bioc <- bioc_pkgs[!vapply(
@@ -353,9 +303,10 @@ message("\nPreparing sesame data cache (one-time setup)...\n")
 sesame_cache_ok <- FALSE
 
 tryCatch({
-  ExperimentHub::ExperimentHub()
-  sesameData::sesameDataCache()
-  message("   + sesame data cache ready")
+    ExperimentHub::ExperimentHub()
+    sesameData::sesameDataCache()
+    sesameData::sesameDataCache("HM450.address")
+    message("   + sesame data cache ready")
   sesame_cache_ok <- TRUE
 }, error = function(e) {
   message("   x sesame data cache setup failed:")
@@ -370,6 +321,7 @@ if (!sesame_cache_ok) {
        "       install.packages('BiocManager')\n",
        "       BiocManager::install('sesameData')\n",
        "       sesameData::sesameDataCache()\n",
+       "       sesameData::sesameDataCache('HM450.address')\n",
        "  2. Restart R\n",
        "  3. Re-run this script\n\n",
        "Note: If this remains unavailable, IDAT files will be skipped\n",
@@ -398,28 +350,127 @@ tst_gses <- c(
 
 all_gses <- c(trn_gses, tst_gses)
 
-#--- LOAD REFERENCE OBJECTS ---------------------------------------------------- ### NEED TO IMPLEMENT
+# Some large IDAT sets have a known sesame batch-read failure that is slow and
+# opaque. Route them directly to the already-implemented sample-wise recovery.
+SAMPLEWISE_IDAT_GSES <- c("GSE128235")
 
-AGE_RULES <- load_age_rules(AGE_RULES_FILE)
+#--- DEFINE CHECKPOINT PATHS ---------------------------------------------------
 
-COMMON_CPGS <- common_cpgs_27k_450k(
+PH_TRN_RAW_PATH <- fs::path(DIR_INTER, "ph_trn_raw.qs")
+PH_TST_RAW_PATH <- fs::path(DIR_INTER, "ph_tst_raw.qs")
+
+STEP_1_CHECKPOINT <- fs::path(DIR_INTER, "step_1_phenotype_checkpoint.qs")
+STEP_2_CHECKPOINT <- fs::path(DIR_INTER, "step_2_methylation_checkpoint.qs")
+STEP_3_CHECKPOINT <- fs::path(DIR_INTER, "step_3_probe_filtering_checkpoint.qs")
+STEP_4_CHECKPOINT <- fs::path(DIR_INTER, "step_4_alignment_checkpoint.qs")
+STEP_5_CHECKPOINT <- fs::path(DIR_INTER, "step_5_age_subset_checkpoint.qs")
+
+RAW_MARKER_DIR <- fs::path(DIR_INTER, "raw_stage_markers")
+STEP_2_STUDY_DIR <- fs::path(DIR_INTER, "step_2_methylation_by_study")
+STEP_3_STUDY_DIR <- fs::path(DIR_INTER, "step_3_probe_filtering_by_study")
+
+fs::dir_create(RAW_MARKER_DIR, recurse = TRUE)
+fs::dir_create(STEP_2_STUDY_DIR, recurse = TRUE)
+fs::dir_create(STEP_3_STUDY_DIR, recurse = TRUE)
+
+checkpoint_present <- function(path, min_size = 1024^2) {
+  file.exists(path) && isTRUE(file.size(path) > min_size)
+}
+
+small_checkpoint_present <- function(path, min_size = 1) {
+  file.exists(path) && isTRUE(file.size(path) >= min_size)
+}
+
+dir_has_files <- function(path, pattern = NULL, label = NULL) {
+  label <- label %||% path
+
+  if (!dir.exists(path)) {
+    progress_message("    scan: ", label, " - directory missing")
+    return(FALSE)
+  }
+
+  progress_message(
+    "    scan: ", label,
+    if (is.null(pattern)) "" else paste0(" [pattern: ", pattern, "]"),
+    appendLF = TRUE
+  )
+  t_start <- Sys.time()
+  files <- list.files(
+    path,
+    pattern = pattern,
+    recursive = TRUE,
+    full.names = TRUE,
+    all.files = FALSE,
+    no.. = TRUE
+  )
+
+  has_files <- any(file.exists(files) & !dir.exists(files))
+  progress_message(
+    "    scan done: ", label,
+    " -> ", length(files), " path(s), has_files=", has_files,
+    " (", round(as.numeric(difftime(Sys.time(), t_start, units = "secs")), 1),
+    " sec)"
+  )
+
+  has_files
+}
+
+raw_marker_path <- function(gse_id, stage) {
+  fs::path(RAW_MARKER_DIR, paste0(gse_id, "_", stage, ".done"))
+}
+
+raw_stage_done <- function(gse_id, stage) {
+  file.exists(raw_marker_path(gse_id, stage))
+}
+
+mark_raw_stage_done <- function(gse_id, stage) {
+  writeLines(as.character(Sys.time()), raw_marker_path(gse_id, stage))
+}
+
+study_checkpoint_path <- function(dir, gse_id) {
+  fs::path(dir, paste0(gse_id, ".qs"))
+}
+
+common_cpg_signature <- function(common_cpgs) {
+  paste(
+    length(common_cpgs),
+    paste(head(common_cpgs, 5), collapse = "|"),
+    paste(tail(common_cpgs, 5), collapse = "|"),
+    sep = "::"
+  )
+}
+
+#--- LOAD REFERENCE OBJECTS ----------------------------------------------------
+
+COMMON_CPGS <- autosomal_cpg_panel_hm450(
   drop_sex = TRUE,
-  drop_cross_reactive = TRUE,
-  cross_reactive_file = CROSS_REACTIVE_FILE,
+  drop_ambiguous = TRUE,
   save_manifest = TRUE
 )
 
-message("Fixed common CpG panel size: ", length(COMMON_CPGS))
+message("Programmatic autosomal CpG panel size: ", length(COMMON_CPGS))
+
+COMMON_CPG_SIGNATURE <- common_cpg_signature(COMMON_CPGS)
 
 #--- FETCH RAW PHENOTYPE TABLES ------------------------------------------------
 
 message("\nFetching raw phenotype tables...\n")
 
-ph_trn_raw <- dplyr::bind_rows(lapply(trn_gses, fetch_gse_pheno))
-ph_tst_raw <- dplyr::bind_rows(lapply(tst_gses, fetch_gse_pheno))
+if (file.exists(PH_TRN_RAW_PATH) && file.exists(PH_TST_RAW_PATH)) {
+  message("  Loading cached raw phenotype tables")
+  ph_trn_raw <- safe_checkpoint_read(PH_TRN_RAW_PATH)
+  ph_tst_raw <- safe_checkpoint_read(PH_TST_RAW_PATH)
+} else {
+  ph_trn_raw <- dplyr::bind_rows(lapply(trn_gses, fetch_gse_pheno))
+  ph_tst_raw <- dplyr::bind_rows(lapply(tst_gses, fetch_gse_pheno))
 
-safe_checkpoint_save(ph_trn_raw, fs::path(DIR_INTER, "ph_trn_raw.qs"))
-safe_checkpoint_save(ph_tst_raw, fs::path(DIR_INTER, "ph_tst_raw.qs"))
+  safe_checkpoint_save(ph_trn_raw, PH_TRN_RAW_PATH)
+  safe_checkpoint_save(ph_tst_raw, PH_TST_RAW_PATH)
+}
+
+if (is.null(ph_trn_raw) || is.null(ph_tst_raw)) {
+  stop("Cached raw phenotype checkpoint could not be loaded.")
+}
 
 #--- DOWNLOAD AND EXTRACT SUPPLEMENTARY FILES ----------------------------------
 
@@ -435,30 +486,110 @@ safe_checkpoint_save(ph_tst_raw, fs::path(DIR_INTER, "ph_tst_raw.qs"))
 #  STEP 4: Extract .idat.gz files
 #           -> data/raw/idat/{GSE_ID}/ (final decompressed IDATs)
 
-message("\nStarting supplementary file data extraction...\n")
+message("\nChecking supplementary file download/extraction state...\n")
 
-message("\nStep 1: Downloading supplementary files...")
+message("Step 1: Downloading supplementary files...")
+for (gse_id in all_gses) {
+  download_dir <- fs::path(DIR_RAW_DOWNLOADS, gse_id)
+  progress_message("  [STEP 1/4] ", gse_id, " - checking download state")
 
-invisible(lapply(all_gses, download_geo_raw)) 
+  if (raw_stage_done(gse_id, "download") ||
+      dir_has_files(download_dir, label = paste(gse_id, "download directory"))) {
+    message("  [STEP 1/4] ", gse_id, " - skipped (download files present)")
+    mark_raw_stage_done(gse_id, "download")
+    next
+  }
+
+  download_geo_raw(gse_id)
+
+  if (dir_has_files(download_dir, label = paste(gse_id, "download directory after download"))) {
+    mark_raw_stage_done(gse_id, "download")
+  } else {
+    message("    [!] Download still has no local files; will retry on next run")
+  }
+}
 
 message("\nStep 2: Extracting top-level archives...")
+for (gse_id in all_gses) {
+  extracted_dir <- fs::path(DIR_RAW_EXTRACTED, gse_id)
+  progress_message("  [STEP 2/4] ", gse_id, " - checking top-level extraction state")
 
-invisible(lapply(all_gses, extract_geo_raw))
+  if (raw_stage_done(gse_id, "extract_top") ||
+      dir_has_files(extracted_dir, label = paste(gse_id, "top-level extraction directory"))) {
+    message("  [STEP 2/4] ", gse_id, " - skipped (top-level extraction present)")
+    mark_raw_stage_done(gse_id, "extract_top")
+    next
+  }
+
+  extract_geo_raw(gse_id)
+
+  if (dir_has_files(extracted_dir, label = paste(gse_id, "top-level extraction directory after extract")) ||
+      !dir_has_files(
+        fs::path(DIR_RAW_DOWNLOADS, gse_id),
+        "\\.(tar|tar\\.gz|tgz)$",
+        label = paste(gse_id, "download archives")
+      )) {
+    mark_raw_stage_done(gse_id, "extract_top")
+  } else {
+    message("    [!] Top-level extraction produced no files; will retry on next run")
+  }
+}
 
 message("\nStep 3: Extracting nested TAR files...")
+for (gse_id in all_gses) {
+  tar_dir <- fs::path(DIR_RAW_TAR, gse_id)
+  progress_message("  [STEP 3/4] ", gse_id, " - checking nested extraction state")
 
-invisible(lapply(all_gses, extract_nested_tar_files))
+  if (raw_stage_done(gse_id, "extract_nested") ||
+      dir_has_files(tar_dir, label = paste(gse_id, "nested extraction directory"))) {
+    message("  [STEP 3/4] ", gse_id, " - skipped (nested extraction present)")
+    mark_raw_stage_done(gse_id, "extract_nested")
+    next
+  }
+
+  extract_nested_tar_files(gse_id)
+
+  if (dir_has_files(tar_dir, label = paste(gse_id, "nested extraction directory after extract")) ||
+      !dir_has_files(
+        fs::path(DIR_RAW_EXTRACTED, gse_id),
+        "\\.(tar|tar\\.gz|tgz)$",
+        label = paste(gse_id, "top-level extracted archives")
+      )) {
+    mark_raw_stage_done(gse_id, "extract_nested")
+  } else {
+    message("    [!] Nested extraction produced no files; will retry on next run")
+  }
+}
 
 message("\nStep 4: Extracting .idat.gz files...")
+for (gse_id in all_gses) {
+  idat_dir <- fs::path(DIR_RAW_IDAT, gse_id)
+  progress_message("  [STEP 4/4] ", gse_id, " - checking IDAT extraction state")
 
-invisible(lapply(all_gses, extract_idat_gz_files))
+  if (raw_stage_done(gse_id, "extract_idat") ||
+      dir_has_files(idat_dir, "\\.idat$", label = paste(gse_id, "IDAT directory"))) {
+    message("  [STEP 4/4] ", gse_id, " - skipped (IDAT extraction present)")
+    mark_raw_stage_done(gse_id, "extract_idat")
+    next
+  }
 
-cross_reactive <- load_cross_reactive_probes(CROSS_REACTIVE_FILE)                ### NEED TO IMPLEMENT
+  extract_idat_gz_files(gse_id)
 
-if (length(cross_reactive) > 0) {
-  message(length(cross_reactive), " cross-reactive probes to remove.")
-} else {
-  message("No cross-reactive probe file found; skipping that filter.")
+  if (dir_has_files(idat_dir, "\\.idat$", label = paste(gse_id, "IDAT directory after extract")) ||
+      (!dir_has_files(
+        fs::path(DIR_RAW_EXTRACTED, gse_id),
+        "\\.idat\\.gz$",
+        label = paste(gse_id, "top-level extracted IDAT gz files")
+      ) &&
+       !dir_has_files(
+         fs::path(DIR_RAW_TAR, gse_id),
+         "\\.idat\\.gz$",
+         label = paste(gse_id, "nested extracted IDAT gz files")
+       ))) {
+    mark_raw_stage_done(gse_id, "extract_idat")
+  } else {
+    message("    [!] IDAT extraction produced no files; will retry on next run")
+  }
 }
 
 #=== PREPROCESS ALL STUDIES ====================================================
@@ -487,9 +618,7 @@ studies <- setNames(vector("list", length(all_gses)), all_gses)
 #       skipped if a full checkpoint exists. Set SKIP_STEP_1 <- FALSE to rerun,
 #       or TRUE to load saved results.
 
-SKIP_STEP_1 <- FALSE
-
-STEP_1_CHECKPOINT <- fs::path(DIR_INTER, "step_1_phenotype_checkpoint.qs")
+SKIP_STEP_1 <- file.exists(STEP_1_CHECKPOINT)
 
 if (SKIP_STEP_1 && file.exists(STEP_1_CHECKPOINT)) {                             ### QC CODE CHECKS UP TO HERE
 
@@ -538,19 +667,23 @@ if (!SKIP_STEP_1 || is.null(studies_loaded)) {
     message(" -> extracting age...", appendLF = FALSE)
     
     ph$age <- extract_age_robust(ph)
+    ph$is_control <- infer_control_status(ph)
     
     n_age_success <- sum(!is.na(ph$age))
     pct_age_success <- if (nrow(ph) > 0) 
       round(100 * n_age_success / nrow(ph), 1) else 0
     
-    message(" (", n_age_success, "/", nrow(ph), " = ", pct_age_success, "% parsed)")
+    n_control <- sum(ph$is_control %in% TRUE, na.rm = TRUE)
+    n_case <- sum(ph$is_control %in% FALSE, na.rm = TRUE)
+    message(" (", n_age_success, "/", nrow(ph), " = ", pct_age_success,
+            "% parsed; controls/cases: ", n_control, "/", n_case, ")")
     
     # Debug: Show available columns if age parsing failed
     if (pct_age_success == 0 && nrow(ph) > 0) {
       char_cols <- names(ph)[vapply(ph, function(z) is.character(z) || is.factor(z), logical(1))]
       num_cols <- names(ph)[vapply(ph, is.numeric, logical(1))]
-      age_like_char <- char_cols[stringr::str_detect(tolower(char_cols), "age|gestational|donor_age|chronological")]
-      age_like_num <- num_cols[stringr::str_detect(tolower(num_cols), "age|gestational|donor_age|chronological")]
+      age_like_char <- char_cols[is_age_metadata_column(char_cols)]
+      age_like_num <- num_cols[is_age_metadata_column(num_cols)]
       
       if (length(age_like_char) > 0 || length(age_like_num) > 0) {
         message("    [DEBUG] Available age-like columns: ",
@@ -589,11 +722,22 @@ if (!SKIP_STEP_1 || is.null(studies_loaded)) {
 # NOTE: IDAT files are extracted in the supplementary file extraction steps
 #       (STEPS 1-4 above) and stored in data/raw/idat/{GSE_ID}/.
 
-SKIP_STEP_2 <- FALSE                                                             
+studies_loaded <- NULL
 
-STEP_2_CHECKPOINT <- fs::path(DIR_INTER, "step_2_methylation_checkpoint.qs")
+SKIP_STEP_2 <- checkpoint_present(STEP_2_CHECKPOINT) &&
+  !checkpoint_present(STEP_3_CHECKPOINT) &&
+  !checkpoint_present(STEP_4_CHECKPOINT) &&
+  !checkpoint_present(STEP_5_CHECKPOINT)
 
-if (SKIP_STEP_2 && file.exists(STEP_2_CHECKPOINT)) {
+if (!SKIP_STEP_2 && checkpoint_present(STEP_3_CHECKPOINT)) {
+  message("\n[STEP 2/6] Skipping methylation checkpoint load; later checkpoint exists.")
+}
+
+if (SKIP_STEP_2 &&
+    !checkpoint_present(STEP_3_CHECKPOINT) &&
+    !checkpoint_present(STEP_4_CHECKPOINT) &&
+    !checkpoint_present(STEP_5_CHECKPOINT) &&
+    checkpoint_present(STEP_2_CHECKPOINT)) {
 
   message("\n[STEP 2/6] Loading methylation data from checkpoint...")
 
@@ -608,7 +752,10 @@ if (SKIP_STEP_2 && file.exists(STEP_2_CHECKPOINT)) {
   }
 }
 
-if (!SKIP_STEP_2 || is.null(studies_loaded)) {
+if ((!SKIP_STEP_2 || is.null(studies_loaded)) &&
+    !checkpoint_present(STEP_3_CHECKPOINT) &&
+    !checkpoint_present(STEP_4_CHECKPOINT) &&
+    !checkpoint_present(STEP_5_CHECKPOINT)) {
 
   message("\n[STEP 2/6] Reading methylation data for all studies...")
 
@@ -617,19 +764,57 @@ if (!SKIP_STEP_2 || is.null(studies_loaded)) {
     message("  [", match(gse_id, all_gses), "/", length(all_gses), "] ", gse_id, 
       " - Reading methylation data...", appendLF = FALSE)
 
+    study_ckpt <- study_checkpoint_path(STEP_2_STUDY_DIR, gse_id)
+    study_loaded <- NULL
+
+    if (small_checkpoint_present(study_ckpt)) {
+      progress_message("    Step 2 cache found for ", gse_id, ": ", study_ckpt)
+      study_loaded <- safe_checkpoint_read(study_ckpt)
+    } else {
+      progress_message("    No Step 2 per-study cache for ", gse_id)
+    }
+
+    if (!is.null(study_loaded) && is.list(study_loaded) &&
+        "meth" %in% names(study_loaded)) {
+      studies[[gse_id]]$meth <- study_loaded$meth
+      studies[[gse_id]]$method <- study_loaded$method %||% NA_character_
+
+      if (is.null(study_loaded$meth)) {
+        message(" [CACHED FAILED/NO DATA]")
+      } else {
+        message(" [CACHED] (", nrow(study_loaded$meth), " probes x ",
+                ncol(study_loaded$meth), " samples)")
+      }
+
+      next
+    }
+
     gse_dir <- fs::path(DIR_RAW_IDAT, gse_id)
 
     # Try IDAT files first
-    beta <- read_beta_from_idats(gse_dir)
+    progress_message("    Attempting IDAT read for ", gse_id)
+    beta <- read_beta_from_idats(
+      gse_dir,
+      force_samplewise = gse_id %in% SAMPLEWISE_IDAT_GSES
+    )
 
     method <- "idat_sesame_openSesame_beta"
 
     # Fallback to series matrix if IDATs unavailable
     if (is.null(beta)) {
-      message(" (no IDATs found, fallback to series matrix)", appendLF = FALSE)
+      message(" (IDAT unavailable/failed, fallback to series matrix)", appendLF = FALSE)
+      progress_message("    Attempting GEO series matrix fallback for ", gse_id)
       expr <- read_expr_from_series_matrix(gse_id)
+      progress_message("    Normalizing GEO series matrix fallback for ", gse_id)
       beta <- normalize_expr_fallback_to_beta(expr)
       method <- "series_matrix_exprs_fallback"
+    }
+
+    if (is.null(beta)) {
+      message(" (fallback to supplementary matrix)", appendLF = FALSE)
+      progress_message("    Attempting supplementary matrix fallback for ", gse_id)
+      beta <- read_beta_from_supplementary_matrix(gse_id)
+      method <- "supplementary_matrix_beta"
     }
 
     if (is.null(beta)) {
@@ -643,6 +828,20 @@ if (!SKIP_STEP_2 || is.null(studies_loaded)) {
       studies[[gse_id]]$meth <- beta
       studies[[gse_id]]$method <- method
     }
+
+    progress_message("    Saving Step 2 per-study cache for ", gse_id)
+    safe_checkpoint_save(
+      list(
+        gse = gse_id,
+        meth = studies[[gse_id]]$meth,
+        method = studies[[gse_id]]$method %||% NA_character_,
+        n_probes = if (is.null(studies[[gse_id]]$meth)) NA_integer_ else nrow(studies[[gse_id]]$meth),
+        n_samples = if (is.null(studies[[gse_id]]$meth)) NA_integer_ else ncol(studies[[gse_id]]$meth),
+        created_at = as.character(Sys.time())
+      ),
+      study_ckpt
+    )
+    progress_message("    Step 2 per-study cache complete for ", gse_id)
   }
 
   message("   + Step 2 complete: Methylation data loaded")
@@ -658,14 +857,22 @@ if (!SKIP_STEP_2 || is.null(studies_loaded)) {
 
 # Remove problematic probes:
 #   3a. Deduplicate probe rows (average if same probe appears multiple times)
-#   3b. Remove non-autosomal probes                                              ### NEED TO IMPLEMENT
-#   3c. Remove cross-reactive / multi-mapping probes                             ### NEED TO IMPLEMENT
+#   3b. Restrict to programmatic autosomal probe panel
 
-SKIP_STEP_3 <- FALSE
+studies_loaded <- NULL
 
-STEP_3_CHECKPOINT <- fs::path(DIR_INTER, "step_3_probe_filtering_checkpoint.qs")
+SKIP_STEP_3 <- checkpoint_present(STEP_3_CHECKPOINT) &&
+  !checkpoint_present(STEP_4_CHECKPOINT) &&
+  !checkpoint_present(STEP_5_CHECKPOINT)
 
-if (SKIP_STEP_3 && file.exists(STEP_3_CHECKPOINT)) {
+if (!SKIP_STEP_3 && checkpoint_present(STEP_4_CHECKPOINT)) {
+  message("\n[STEP 3/6] Skipping probe-filtered checkpoint load; later checkpoint exists.")
+}
+
+if (SKIP_STEP_3 &&
+    !checkpoint_present(STEP_4_CHECKPOINT) &&
+    !checkpoint_present(STEP_5_CHECKPOINT) &&
+    checkpoint_present(STEP_3_CHECKPOINT)) {
   message("\n[STEP 3/6] Loading probe-filtered data from checkpoint...")
   studies_loaded <- safe_checkpoint_read(STEP_3_CHECKPOINT)
   if (!is.null(studies_loaded)) {
@@ -677,7 +884,9 @@ if (SKIP_STEP_3 && file.exists(STEP_3_CHECKPOINT)) {
   }
 }
 
-if (!SKIP_STEP_3 || is.null(studies_loaded)) {
+if ((!SKIP_STEP_3 || is.null(studies_loaded)) &&
+    !checkpoint_present(STEP_4_CHECKPOINT) &&
+    !checkpoint_present(STEP_5_CHECKPOINT)) {
   message("\n[STEP 3/6] Filtering probes for all studies...")
 
   for (gse_id in all_gses) {
@@ -690,28 +899,81 @@ if (!SKIP_STEP_3 || is.null(studies_loaded)) {
       next
     }
 
+    study_ckpt <- study_checkpoint_path(STEP_3_STUDY_DIR, gse_id)
+    study_loaded <- NULL
+
+    if (small_checkpoint_present(study_ckpt)) {
+      progress_message("    Step 3 cache found for ", gse_id, ": ", study_ckpt)
+      study_loaded <- safe_checkpoint_read(study_ckpt)
+    } else {
+      progress_message("    No Step 3 per-study cache for ", gse_id)
+    }
+
+    if (!is.null(study_loaded) && is.list(study_loaded) &&
+        identical(study_loaded$common_cpg_signature, COMMON_CPG_SIGNATURE) &&
+        "meth" %in% names(study_loaded)) {
+      studies[[gse_id]]$meth <- study_loaded$meth
+
+      if (is.null(study_loaded$meth)) {
+        message("    [CACHED - no usable methylation data]")
+      } else {
+        message("    [CACHED] After common-panel filtering: ",
+                nrow(study_loaded$meth), " probes")
+      }
+
+      next
+    }
+
     beta <- studies[[gse_id]]$meth
 
     # 3a. Deduplicate probe rows
     
+    progress_message("    Deduplicating probe rows for ", gse_id)
     beta <- dedup_probe_rows(beta)
+
+    if (is.null(beta) || is.null(dim(beta)) || length(dim(beta)) != 2 ||
+        nrow(beta) == 0 || ncol(beta) == 0) {
+      message("    [!] Skipping (invalid methylation matrix after deduplication)")
+      studies[[gse_id]]$meth <- NULL
+      next
+    }
+
     message("    - After deduplication: ", nrow(beta), " probes")
 
-    # 3b. Remove non-autosomal probes
-    
-    beta <- drop_non_autosomal_probes(beta)
-    message("    - After removing non-autosomal: ", nrow(beta), " probes")
-
-    # 3c. Remove cross-reactive probes
+    # 3b. Restrict to the programmatic common CpG panel
     
     beta_before <- nrow(beta)
-    beta <- drop_cross_reactive_probes(beta, cross_reactive = cross_reactive)
+    progress_message("    Restricting ", gse_id, " to common CpG panel")
+    beta <- restrict_to_common_cpgs(beta, COMMON_CPGS)
+
+    if (is.null(beta) || is.null(dim(beta)) || length(dim(beta)) != 2 ||
+        nrow(beta) == 0 || ncol(beta) == 0) {
+      message("    [!] Skipping (no usable probes after common-panel filtering)")
+      studies[[gse_id]]$meth <- NULL
+      next
+    }
+
     beta_after <- nrow(beta)
     removed <- beta_before - beta_after
-    message("    - After removing cross-reactive: ", 
+    message("    - After common-panel filtering: ",
             nrow(beta), " probes (removed ", removed, ")")
 
     studies[[gse_id]]$meth <- beta
+
+    progress_message("    Saving Step 3 per-study cache for ", gse_id)
+    safe_checkpoint_save(
+      list(
+        gse = gse_id,
+        meth = beta,
+        method = studies[[gse_id]]$method %||% NA_character_,
+        common_cpg_signature = COMMON_CPG_SIGNATURE,
+        n_probes = nrow(beta),
+        n_samples = ncol(beta),
+        created_at = as.character(Sys.time())
+      ),
+      study_ckpt
+    )
+    progress_message("    Step 3 per-study cache complete for ", gse_id)
   }
 
   message("   + Step 3 complete: Probes filtered")
@@ -728,11 +990,11 @@ if (!SKIP_STEP_3 || is.null(studies_loaded)) {
 # Remove unmatched samples.
 # Standardize column names to GEO accession IDs.
 
-SKIP_STEP_4 <- FALSE
+studies_loaded <- NULL
 
-STEP_4_CHECKPOINT <- fs::path(DIR_INTER, "step_4_alignment_checkpoint.qs")
+SKIP_STEP_4 <- checkpoint_present(STEP_4_CHECKPOINT)
 
-if (SKIP_STEP_4 && file.exists(STEP_4_CHECKPOINT)) {
+if (SKIP_STEP_4 && checkpoint_present(STEP_4_CHECKPOINT)) {
   message("\n[STEP 4/6] Loading aligned data from checkpoint...")
   studies_loaded <- safe_checkpoint_read(STEP_4_CHECKPOINT)
   if (!is.null(studies_loaded)) {
@@ -760,6 +1022,18 @@ if (!SKIP_STEP_4 || is.null(studies_loaded)) {
 
     ph <- studies[[gse_id]]$pheno
     mat <- studies[[gse_id]]$meth
+
+    if (is.null(dim(mat)) || length(dim(mat)) != 2 ||
+        nrow(mat) == 0 || ncol(mat) == 0) {
+      message(" [SKIPPED - invalid methylation matrix]")
+      studies[[gse_id]]$pheno <- ph[0, , drop = FALSE]
+      studies[[gse_id]]$meth <- NULL
+      next
+    }
+
+    if (!"is_control" %in% names(ph)) {
+      ph$is_control <- infer_control_status(ph)
+    }
     
     n_pheno_start <- nrow(ph)
     n_meth_start <- ncol(mat)
@@ -793,11 +1067,11 @@ if (!SKIP_STEP_4 || is.null(studies_loaded)) {
 # Retain only samples with successfully parsed age values.
 # Ensure 1:1 correspondence between matrix columns and phenotype rows.
 
-SKIP_STEP_5 <- FALSE
+studies_loaded <- NULL
 
-STEP_5_CHECKPOINT <- fs::path(DIR_INTER, "step_5_age_subset_checkpoint.qs")
+SKIP_STEP_5 <- checkpoint_present(STEP_5_CHECKPOINT)
 
-if (SKIP_STEP_5 && file.exists(STEP_5_CHECKPOINT)) {
+if (SKIP_STEP_5 && checkpoint_present(STEP_5_CHECKPOINT)) {
   message("\n[STEP 5/6] Loading age-subset data from checkpoint...")
   studies_loaded <- safe_checkpoint_read(STEP_5_CHECKPOINT)
   if (!is.null(studies_loaded)) {
@@ -824,6 +1098,14 @@ if (!SKIP_STEP_5 || is.null(studies_loaded)) {
 
     ph <- studies[[gse_id]]$pheno
     mat <- studies[[gse_id]]$meth
+
+    if (is.null(dim(mat)) || length(dim(mat)) != 2 ||
+        nrow(mat) == 0 || ncol(mat) == 0) {
+      message("    [!] Skipping (invalid or empty methylation matrix)")
+      studies[[gse_id]]$pheno <- ph[0, , drop = FALSE]
+      studies[[gse_id]]$meth <- NULL
+      next
+    }
 
     # Keep only samples with age
     
@@ -866,15 +1148,16 @@ for (gse_id in all_gses) {
 
   # Handle case with no methylation data
   
-  if (is.null(mat)) {
+  if (is.null(mat) || is.null(dim(mat)) || length(dim(mat)) != 2 ||
+      nrow(mat) == 0 || ncol(mat) == 0) {
     message("    [!] Skipping (no methylation data)")
     proc_all[[gse_id]] <- list(
       gse = gse_id,
-      method = studies[[gse_id]]$method,
+      method = studies[[gse_id]]$method %||% NA_character_,
       ph = ph[0, , drop = FALSE],
       mat = NULL,
-      n_parsed_age = studies[[gse_id]]$n_age_parsed,
-      n_total_pheno = studies[[gse_id]]$n_pheno_total
+      n_parsed_age = studies[[gse_id]]$n_age_parsed %||% NA_real_,
+      n_total_pheno = studies[[gse_id]]$n_pheno_total %||% NA_real_
     )
     next
   }
@@ -905,11 +1188,11 @@ for (gse_id in all_gses) {
   
   proc_all[[gse_id]] <- list(
     gse = gse_id,
-    method = studies[[gse_id]]$method,
+    method = studies[[gse_id]]$method %||% NA_character_,
     ph = ph,
     mat = mat,
-    n_parsed_age = studies[[gse_id]]$n_age_parsed,
-    n_total_pheno = studies[[gse_id]]$n_pheno_total
+    n_parsed_age = studies[[gse_id]]$n_age_parsed %||% NA_real_,
+    n_total_pheno = studies[[gse_id]]$n_pheno_total %||% NA_real_
   )
 }
 
@@ -929,6 +1212,10 @@ train_manifest <- tibble::tibble(
   method = vapply(proc_trn, `[[`, character(1), "method"),
   n_pheno_total = vapply(proc_trn, `[[`, numeric(1), "n_total_pheno"),
   n_age_parsed = vapply(proc_trn, `[[`, numeric(1), "n_parsed_age"),
+  n_controls = vapply(proc_trn,
+    function(x) sum(x$ph$is_control %in% TRUE, na.rm = TRUE), integer(1)),
+  n_cases = vapply(proc_trn,
+    function(x) sum(x$ph$is_control %in% FALSE, na.rm = TRUE), integer(1)),
   n_cpg_raw = vapply(proc_trn, 
     function(x) if (is.null(x$mat)) NA_integer_ else nrow(x$mat), integer(1)),
   n_samples_final = vapply(proc_trn, 
@@ -940,6 +1227,10 @@ test_manifest <- tibble::tibble(
   method = vapply(proc_tst, `[[`, character(1), "method"),
   n_pheno_total = vapply(proc_tst, `[[`, numeric(1), "n_total_pheno"),
   n_age_parsed = vapply(proc_tst, `[[`, numeric(1), "n_parsed_age"),
+  n_controls = vapply(proc_tst,
+    function(x) sum(x$ph$is_control %in% TRUE, na.rm = TRUE), integer(1)),
+  n_cases = vapply(proc_tst,
+    function(x) sum(x$ph$is_control %in% FALSE, na.rm = TRUE), integer(1)),
   n_cpg_raw = vapply(proc_tst, 
     function(x) if (is.null(x$mat)) NA_integer_ else nrow(x$mat), integer(1)),
   n_samples_final = vapply(proc_tst, 

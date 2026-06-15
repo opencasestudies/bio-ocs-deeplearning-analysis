@@ -39,7 +39,6 @@
 #
 #             - GEOquery      (Retrieve GEO data)
 #             - sesame        (Process DNA methylation IDATs)
-#             - minfi         (Alternative methylation processing)
 #             - qs2           (Save/load data efficiently)
 #             - glmnet        (Elastic net modeling)
 #             - torch         (Deep learning backend)
@@ -65,6 +64,12 @@
 #             - demo_analysis_results.qs
 #             - demo_elasticnet_model.qs
 #             - demo_predictions.csv
+#             - demo_eda_sample_summary.csv
+#             - demo_eda_study_summary.csv
+#             - demo_eda_cpg_summary.csv
+#             - demo_eda_overview.png
+#             - demo_eda_pca.png
+#             - demo_eda_age_cpg_relationships.png
 #             - demo_analysis_plots.png
 #
 #  NOTES:   This script demonstrates key concepts:
@@ -138,6 +143,11 @@ if (!requireNamespace("scorcher", quietly = TRUE)) {
   }
   pak::pak("jtleek/scorcher")
   library(scorcher)
+}
+
+if (!requireNamespace("cowplot", quietly = TRUE)) {
+  message(" ! cowplot package required. Installing...")
+  utils::install.packages("cowplot", quietly = TRUE)
 }
 
 library(torch)
@@ -565,6 +575,23 @@ if (!all(pheno_test$sample_id == rownames(beta_test))) {
 
 message(" + Data alignment confirmed")
 
+# Align CpG probes across studies before any cross-study summaries or modeling.
+common_cpgs <- colnames(beta_train)[colnames(beta_train) %in% colnames(beta_test)]
+
+if (length(common_cpgs) == 0) {
+  stop("No shared CpG sites found between training and test studies.")
+}
+
+message("\nAligning CpG sites across studies...")
+message("  Shared CpGs: ", length(common_cpgs))
+message("  Training-only CpGs removed: ", ncol(beta_train) - length(common_cpgs))
+message("  Test-only CpGs removed:     ", ncol(beta_test) - length(common_cpgs))
+
+beta_train <- beta_train[, common_cpgs, drop = FALSE]
+beta_test  <- beta_test[, common_cpgs, drop = FALSE]
+
+message(" + CpG probe alignment confirmed\n")
+
 # Remove samples with missing age
 message("\nRemoving samples with missing age data...")
 
@@ -601,10 +628,50 @@ message("Test Set Age Summary:\n")
 print(summary(pheno_test$age))
 message("\n")
 
+# Sample-level methylation summaries
+train_medians <- apply(beta_train, 1, median, na.rm = TRUE)
+test_medians  <- apply(beta_test, 1, median, na.rm = TRUE)
+train_means   <- rowMeans(beta_train, na.rm = TRUE)
+test_means    <- rowMeans(beta_test, na.rm = TRUE)
+
+sample_eda <- dplyr::bind_rows(
+  data.frame(
+    sample_id = pheno_train$sample_id,
+    study = pheno_train$study,
+    dataset = "Training",
+    age = pheno_train$age,
+    mean_beta = train_means,
+    median_beta = train_medians,
+    missing_fraction = rowMeans(is.na(beta_train)),
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    sample_id = pheno_test$sample_id,
+    study = pheno_test$study,
+    dataset = "Test",
+    age = pheno_test$age,
+    mean_beta = test_means,
+    median_beta = test_medians,
+    missing_fraction = rowMeans(is.na(beta_test)),
+    stringsAsFactors = FALSE
+  )
+)
+
+study_eda <- sample_eda |>
+  dplyr::group_by(dataset, study) |>
+  dplyr::summarise(
+    n_samples = dplyr::n(),
+    age_min = min(age, na.rm = TRUE),
+    age_median = median(age, na.rm = TRUE),
+    age_max = max(age, na.rm = TRUE),
+    median_beta_median = median(median_beta, na.rm = TRUE),
+    missing_fraction_max = max(missing_fraction, na.rm = TRUE),
+    .groups = "drop"
+  )
+
 # Beta value statistics
 message("Beta Value Statistics:\n")
 message("  Training set (median methylation across all CpGs):")
-train_medians <- apply(beta_train, 1, median, na.rm = TRUE)
 message("    Median: ", round(median(train_medians), 3))
 message("    Range:  [", round(min(train_medians, na.rm=T), 3), ", ",
         round(max(train_medians, na.rm=T), 3), "]\n")
@@ -612,10 +679,272 @@ message("    Range:  [", round(min(train_medians, na.rm=T), 3), ", ",
 # CpG variability
 message("  CpG Site Variability:")
 cpg_vars <- apply(beta_train, 2, var, na.rm = TRUE)
+cpg_means <- colMeans(beta_train, na.rm = TRUE)
+cpg_missing <- colMeans(is.na(beta_train))
+
 message("    Median variance: ", round(median(cpg_vars, na.rm=T), 4))
 message("    IQR:             [", 
         round(quantile(cpg_vars, 0.25, na.rm=T), 4), ", ",
         round(quantile(cpg_vars, 0.75, na.rm=T), 4), "]\n")
+
+message("Missing Data Summary:")
+message("  Training sample max missing fraction: ",
+        round(max(sample_eda$missing_fraction[sample_eda$dataset == "Training"],
+                  na.rm = TRUE), 4))
+message("  Test sample max missing fraction:     ",
+        round(max(sample_eda$missing_fraction[sample_eda$dataset == "Test"],
+                  na.rm = TRUE), 4))
+message("  CpG max missing fraction, training:   ",
+        round(max(cpg_missing, na.rm = TRUE), 4), "\n")
+
+message("Saving exploratory summary tables...")
+
+readr::write_csv(sample_eda, fs::path(demo_out_dir, "demo_eda_sample_summary.csv"))
+readr::write_csv(study_eda, fs::path(demo_out_dir, "demo_eda_study_summary.csv"))
+
+# Estimate age associations on the most variable CpGs to keep EDA fast.
+age_cor_candidates <- names(sort(cpg_vars, decreasing = TRUE, na.last = NA))[
+  seq_len(min(1000, sum(!is.na(cpg_vars))))
+]
+
+age_correlations <- vapply(age_cor_candidates, function(cpg_id) {
+  cpg_values <- beta_train[, cpg_id]
+  if (sum(!is.na(cpg_values)) < 3 || stats::sd(cpg_values, na.rm = TRUE) == 0) {
+    return(NA_real_)
+  }
+  stats::cor(cpg_values, pheno_train$age, use = "complete.obs")
+}, numeric(1))
+
+top_age_cpgs <- names(sort(abs(age_correlations), decreasing = TRUE, na.last = NA))[
+  seq_len(min(6, sum(!is.na(age_correlations))))
+]
+
+top_variance_cpgs <- names(sort(cpg_vars, decreasing = TRUE, na.last = NA))[
+  seq_len(min(100, sum(!is.na(cpg_vars))))
+]
+
+cpg_eda <- dplyr::bind_rows(
+  data.frame(
+    cpg_id = top_variance_cpgs,
+    selection_reason = "highest_training_variance",
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    cpg_id = top_age_cpgs,
+    selection_reason = "strongest_age_correlation",
+    stringsAsFactors = FALSE
+  )
+) |>
+  dplyr::distinct(cpg_id, .keep_all = TRUE) |>
+  dplyr::mutate(
+    mean_beta = cpg_means[cpg_id],
+    variance = cpg_vars[cpg_id],
+    missing_fraction = cpg_missing[cpg_id],
+    age_correlation = age_correlations[cpg_id]
+  ) |>
+  dplyr::arrange(dplyr::desc(abs(age_correlation)), dplyr::desc(variance))
+
+readr::write_csv(cpg_eda, fs::path(demo_out_dir, "demo_eda_cpg_summary.csv"))
+
+message(" + EDA tables saved\n")
+
+message("Creating exploratory visualizations...")
+
+eda_colors <- c("Training" = "#2b6cb0", "Test" = "#dd6b20")
+
+set.seed(20260511)
+beta_plot_cpgs <- sample(
+  seq_len(ncol(beta_train)),
+  size = min(2000, ncol(beta_train))
+)
+
+beta_plot_values <- dplyr::bind_rows(
+  data.frame(
+    dataset = "Training",
+    beta_value = as.numeric(beta_train[, beta_plot_cpgs, drop = FALSE])
+  ),
+  data.frame(
+    dataset = "Test",
+    beta_value = as.numeric(beta_test[, beta_plot_cpgs, drop = FALSE])
+  )
+) |>
+  dplyr::filter(!is.na(beta_value))
+
+p_age <- sample_eda |>
+  ggplot(aes(x = age, fill = dataset)) +
+  geom_histogram(bins = 15, alpha = 0.6, position = "identity",
+                 color = "white") +
+  scale_fill_manual(values = eda_colors) +
+  labs(
+    title = "Age Distribution",
+    x = "Chronological age (years)",
+    y = "Samples"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top")
+
+p_sample_beta <- sample_eda |>
+  ggplot(aes(x = dataset, y = median_beta, fill = dataset)) +
+  geom_boxplot(width = 0.45, outlier.shape = NA, alpha = 0.75) +
+  geom_jitter(width = 0.08, alpha = 0.65, size = 1.8) +
+  scale_fill_manual(values = eda_colors) +
+  labs(
+    title = "Sample Median Methylation",
+    x = NULL,
+    y = "Median beta value"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"), legend.position = "none")
+
+p_beta_density <- beta_plot_values |>
+  ggplot(aes(x = beta_value, color = dataset, fill = dataset)) +
+  geom_density(alpha = 0.18, linewidth = 0.8) +
+  scale_color_manual(values = eda_colors) +
+  scale_fill_manual(values = eda_colors) +
+  labs(
+    title = "Beta Value Distribution",
+    subtitle = paste("Random sample of", length(beta_plot_cpgs), "CpGs"),
+    x = "Beta value",
+    y = "Density"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"), legend.position = "top")
+
+p_cpg_var <- data.frame(variance = cpg_vars) |>
+  dplyr::filter(is.finite(variance), variance > 0) |>
+  ggplot(aes(x = variance)) +
+  geom_histogram(bins = 40, fill = "#4a5568", color = "white") +
+  scale_x_log10() +
+  labs(
+    title = "CpG Variability",
+    x = "Training-set variance, log10 scale",
+    y = "CpG sites"
+  ) +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold"))
+
+eda_overview_plot <- cowplot::plot_grid(
+  p_age, p_sample_beta, p_beta_density, p_cpg_var,
+  ncol = 2
+)
+
+ggsave(
+  fs::path(demo_out_dir, "demo_eda_overview.png"),
+  eda_overview_plot,
+  width = 13,
+  height = 9,
+  dpi = 300
+)
+
+message(" + EDA overview plot saved: demo_eda_overview.png")
+
+# PCA gives a quick view of whether train/test studies separate globally.
+pca_cpgs <- names(sort(cpg_vars, decreasing = TRUE, na.last = NA))[
+  seq_len(min(500, sum(!is.na(cpg_vars))))
+]
+
+if (length(pca_cpgs) >= 2 && nrow(sample_eda) >= 3) {
+  pca_mat <- rbind(
+    beta_train[, pca_cpgs, drop = FALSE],
+    beta_test[, pca_cpgs, drop = FALSE]
+  )
+  pca_medians <- apply(beta_train[, pca_cpgs, drop = FALSE], 2, median,
+                       na.rm = TRUE)
+  
+  for (j in seq_len(ncol(pca_mat))) {
+    missing_idx <- is.na(pca_mat[, j])
+    if (any(missing_idx)) {
+      pca_mat[missing_idx, j] <- pca_medians[j]
+    }
+  }
+  
+  pca_sds <- apply(pca_mat, 2, sd, na.rm = TRUE)
+  pca_mat <- pca_mat[, is.finite(pca_sds) & pca_sds > 0, drop = FALSE]
+  
+  if (ncol(pca_mat) >= 2) {
+    pca_fit <- prcomp(pca_mat, center = TRUE, scale. = TRUE)
+    pca_var <- 100 * (pca_fit$sdev^2 / sum(pca_fit$sdev^2))
+    
+    pca_df <- data.frame(
+      sample_eda,
+      PC1 = pca_fit$x[, 1],
+      PC2 = pca_fit$x[, 2]
+    )
+    
+    p_pca <- pca_df |>
+      ggplot(aes(x = PC1, y = PC2, color = dataset, shape = study)) +
+      geom_point(size = 3, alpha = 0.85) +
+      scale_color_manual(values = eda_colors) +
+      labs(
+        title = "PCA of Most Variable CpGs",
+        subtitle = paste(length(colnames(pca_mat)), "CpGs after variance filtering"),
+        x = paste0("PC1 (", round(pca_var[1], 1), "%)"),
+        y = paste0("PC2 (", round(pca_var[2], 1), "%)")
+      ) +
+      theme_minimal() +
+      theme(plot.title = element_text(face = "bold"), legend.position = "right")
+    
+    ggsave(
+      fs::path(demo_out_dir, "demo_eda_pca.png"),
+      p_pca,
+      width = 9,
+      height = 6,
+      dpi = 300
+    )
+    
+    message(" + PCA plot saved: demo_eda_pca.png")
+  }
+}
+
+if (length(top_age_cpgs) > 0) {
+  relationship_df <- dplyr::bind_rows(
+    tibble::as_tibble(beta_train[, top_age_cpgs, drop = FALSE],
+                      .name_repair = "minimal") |>
+      dplyr::mutate(
+        sample_id = pheno_train$sample_id,
+        age = pheno_train$age,
+        dataset = "Training"
+      ),
+    tibble::as_tibble(beta_test[, top_age_cpgs, drop = FALSE],
+                      .name_repair = "minimal") |>
+      dplyr::mutate(
+        sample_id = pheno_test$sample_id,
+        age = pheno_test$age,
+        dataset = "Test"
+      )
+  ) |>
+    tidyr::pivot_longer(
+      cols = tidyselect::all_of(top_age_cpgs),
+      names_to = "cpg_id",
+      values_to = "beta_value"
+    )
+  
+  p_age_cpg <- relationship_df |>
+    ggplot(aes(x = age, y = beta_value, color = dataset)) +
+    geom_point(alpha = 0.7, size = 1.8) +
+    geom_smooth(method = "lm", se = FALSE, linewidth = 0.8) +
+    facet_wrap(~ cpg_id, scales = "free_y") +
+    scale_color_manual(values = eda_colors) +
+    labs(
+      title = "CpGs Most Associated with Age in Training Data",
+      x = "Chronological age (years)",
+      y = "Beta value"
+    ) +
+    theme_minimal() +
+    theme(plot.title = element_text(face = "bold"), legend.position = "top")
+  
+  ggsave(
+    fs::path(demo_out_dir, "demo_eda_age_cpg_relationships.png"),
+    p_age_cpg,
+    width = 12,
+    height = 8,
+    dpi = 300
+  )
+  
+  message(" + Age-CpG plot saved: demo_eda_age_cpg_relationships.png")
+}
+
+message("\n")
 
 message("These statistics illustrate why deep learning is useful:")
 message("  - Age range is wide (significant aging gradient)")
@@ -1022,6 +1351,15 @@ message(" + Scorcher neural network model saved: demo_scorcher_model.qs")
 summary_list <- list(
   studies = list(train = train_gse, test = test_gse),
   sample_sizes = list(train = nrow(X_train), test = nrow(X_test)),
+  exploratory_data_analysis = list(
+    shared_cpgs = length(common_cpgs),
+    sample_summary = fs::path(demo_out_dir, "demo_eda_sample_summary.csv"),
+    study_summary = fs::path(demo_out_dir, "demo_eda_study_summary.csv"),
+    cpg_summary = fs::path(demo_out_dir, "demo_eda_cpg_summary.csv"),
+    overview_plot = fs::path(demo_out_dir, "demo_eda_overview.png"),
+    pca_plot = fs::path(demo_out_dir, "demo_eda_pca.png"),
+    age_cpg_plot = fs::path(demo_out_dir, "demo_eda_age_cpg_relationships.png")
+  ),
   features = ncol(X_train),
   age_range = list(
     train = c(min(y_train), max(y_train)),
@@ -1070,9 +1408,13 @@ message("=======================================================================
 message("KEY FINDINGS FROM THIS DEMONSTRATION:\n")
 
 message("1. DATA QUALITY:")
-message("   - Both training and test sets covered age range 20-75 years")
+message("   - Training age range: ", round(min(y_train), 1), " - ",
+        round(max(y_train), 1), " years")
+message("   - Test age range:     ", round(min(y_test), 1), " - ",
+        round(max(y_test), 1), " years")
 message("   - CpG sites showed expected variability patterns")
 message("   - No significant missing data after filtering")
+message("   - EDA plots and summary tables saved in data/demo/processed")
 message("")
 
 message("2. ELASTIC NET BASELINE PERFORMANCE:")

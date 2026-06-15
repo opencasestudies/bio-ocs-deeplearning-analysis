@@ -2,900 +2,687 @@
 #
 #  PROGRAM: training.R
 #
-#  AUTHOR:  Stephen Salerno (ssalerno@fredhutch.org)
+#  PURPOSE: Train a DeepMAge-style epigenetic aging clock from the sesame-based
+#           preprocessing output produced by code/data.R.
 #
-#  PURPOSE: Full model training and hyperparameter tuning for epigenetic clock
-#           case study. This script takes the preprocessed training and testing
-#           datasets produced by data.R and implements the complete modeling
-#           pipeline described in the case study.
-#
-#           This script orchestrates the following workflow:
-#
-#             1. Load preprocessed scorcher-ready training and testing objects
-#             2. Perform gradient-based feature selection (top 1000 CpGs)
-#             3. Train elastic net baseline model with cross-validation
-#             4. Perform hyperparameter tuning for scorcher neural network
-#             5. Train final scorcher model on full training set
-#             6. Evaluate both models on held-out test set
-#             7. Compare model performance and generate summary statistics
-#             8. Produce plots and visualizations for model comparison
-#             9. Generate prediction residuals and calibration diagnostics
-#            10. Save final models and evaluation results
-#
-#  DEPENDS: This script depends on the output from data.R:
-#
-#             data/processed/scorcher_train_test.qs
-#
-#           Required packages:
-#
-#             - qs2               (for loading/saving data)
-#             - glmnet            (for elastic net modeling)
-#             - caret             (for cross-validation utilities)
-#             - scorcher          (for neural network training)
-#             - torch             (backend for scorcher)
-#             - tidyverse         (ggplot2, dplyr, purrr)
-#             - yardstick         (for regression metrics)
-#             - fs                (for file system operations)
-#
-#  INPUT:   Preprocessed training and testing arrays from data.R:
-#
-#             x_train: samples x CpGs methylation data (beta values)
-#             y_train: vector of age values for training samples
-#             x_test:  samples x CpGs methylation data (test set)
-#             y_test:  vector of age values for test samples
-#
-#           Each row represents a sample, each column represents a CpG site.
-#
-#  OUTPUT:  Model files and evaluation results saved in:
-#
-#               data/processed/
-#
-#           Key outputs include:
-#
-#             - elasticnet_cv_model.qs
-#             - elasticnet_final_model.qs
-#             - scorcher_hyperparam_grid.csv
-#             - scorcher_tuning_results.csv
-#             - scorcher_final_model.pt  (torch model weights)
-#             - model_comparison_results.csv
-#             - predictions_on_test_set.csv
-#             - evaluation_metrics.qs
-#             - training_log.txt
-#
-#  NOTES:   Key design choices matching the case study methodology:
-#
-#             1. Feature Selection
-#
-#                - Top 1,000 CpGs selected using gradient-based importance
-#                  from an initial scorcher model fit
-#                - This dimensionality reduction is computationally practical
-#                  while retaining most predictive signal
-#
-#             2. Elastic Net Model
-#
-#                - Trained using 5-fold cross-validation
-#                - L1/L2 ratio (alpha) automatically selected via CV
-#                - Coefficient magnitudes examined for interpretability
-#
-#             3. Hyperparameter Tuning
-#
-#                - Grid search across key hyperparameters:
-#                   * Learning rate: 1e-3, 1e-4, 1e-5
-#                   * Dropout rate: 0.1, 0.3, 0.5
-#                   * L2 weight decay: 1e-2, 1e-3, 1e-4
-#                   * Batch size: 32, 64, 128
-#                - 5-fold CV within training set for each configuration
-#                - Configuration with lowest mean MAE selected
-#
-#             4. Model Architecture
-#
-#                - Feed-forward neural network with multiple hidden layers
-#                - Nonlinear activation (ReLU) in hidden layers
-#                - Dropout on hidden layers for regularization
-#                - MAE loss function (L1 loss)
-#                - Adam optimizer for training
-#
-#             5. Evaluation Strategy
-#
-#                - Independent test set validation (not used during training)
-#                - Multiple metrics: MAE, RMSE, Pearson r, R-squared
-#                - Predicted vs observed plots for calibration assessment
-#                - Residual diagnostics for systematic bias
-#
-#  UPDATED: 2026-04-27
+#  This is written as a pedagogical script. The scorcher graph construction is
+#  shown directly in each modeling section instead of hidden behind helper
+#  functions.
 #
 #===============================================================================
 
-#=== SETUP ====================================================================
+message("\nDeepMAge-style scorcher training\n")
 
-message("\n===============================================================================")
-message("EPIGENETIC CLOCK MODEL TRAINING AND EVALUATION")
-message("===============================================================================\n")
+set.seed(1)
 
-message("PRE-SETUP: Working directory and package checks...\n")
-
-# Check working directory
-wd_found <- FALSE
-expected_marker <- "code/training.R"
-
-if (file.exists(expected_marker)) {
-  wd_found <- TRUE
-  message(" + Working directory correct (found ", expected_marker, ")")
-}
-
-if (!wd_found && requireNamespace("rstudioapi", quietly = TRUE)) {
-  tryCatch({
-    wd_try <- rstudioapi::getActiveProject()
-    if (!is.null(wd_try) && file.exists(file.path(wd_try, expected_marker))) {
-      setwd(wd_try)
-      wd_found <- TRUE
-      message(" + RStudio project detected: ", wd_try)
-    }
-  }, error = function(e) NULL)
-}
-
-if (!wd_found) {
-  stop("Could not find project root. Please ensure you're running this script from the project directory.")
-}
-
-# Directory setup
 DIR_DATA <- "data/processed"
-DIR_OUT  <- "data/processed"
+DIR_OUT <- "data/processed"
 
-if (!dir.exists(DIR_DATA)) {
-  stop("Data directory not found: ", DIR_DATA, "\n",
-       "Please run data.R first to generate preprocessed datasets.")
-}
-
-message("\n+ Loading required packages...\n")
-
-required_packages <- c(
-  "qs2", "glmnet", "tidyverse", "caret", "torch", "scorcher",
-  "yardstick", "fs"
-)
-
-for (pkg in required_packages) {
-  if (!requireNamespace(pkg, quietly = TRUE)) {
-    message("   Installing ", pkg, "...")
-    tryCatch({
-      # Try install.packages first
-      utils::install.packages(pkg, quietly = TRUE)
-    }, error = function(e) {
-      message("   Note: ", pkg, " installation may require BiocManager")
-    })
-  } else {
-    message("   (loaded) ", pkg)
-  }
-}
-
-library(tidyverse)
-library(qs2)
-library(glmnet)
-library(torch)
-library(caret)
-library(yardstick)
-library(fs)
-
-message("\n")
-
-#=== LOAD PREPROCESSED DATA ==================================================
-
-message("LOADING PREPROCESSED DATA\n")
-
-data_path <- fs::path(DIR_DATA, "scorcher_train_test.qs")
+data_path <- file.path(DIR_DATA, "scorcher_train_test.qs")
 
 if (!file.exists(data_path)) {
-  stop("Preprocessed data not found: ", data_path, "\n",
-       "Please ensure data.R has been run successfully.")
+  stop("Missing ", data_path, ". Run code/data.R first.")
 }
 
-message(" + Loading: ", data_path)
+cran_pkgs <- c("qs2", "fs", "glmnet", "ggplot2", "readr", "tibble")
 
-scorcher_obj <- qs_read(data_path)
-
-x_train <- scorcher_obj$x_train
-y_train <- scorcher_obj$y_train
-x_test  <- scorcher_obj$x_test
-y_test  <- scorcher_obj$y_test
-
-message("   - Training set: ", nrow(x_train), " samples x ", ncol(x_train), " CpGs")
-message("   - Test set:     ", nrow(x_test), " samples x ", ncol(x_test), " CpGs")
-message("   - Age range (train): ", round(min(y_train, na.rm=T), 1),
-        " - ", round(max(y_train, na.rm=T), 1), " years")
-message("   - Age range (test):  ", round(min(y_test, na.rm=T), 1),
-        " - ", round(max(y_test, na.rm=T), 1), " years")
-message("\n")
-
-# Remove any missing values
-na_idx_train <- which(is.na(y_train))
-na_idx_test  <- which(is.na(y_test))
-
-if (length(na_idx_train) > 0) {
-  message("   Removing ", length(na_idx_train), " training samples with missing age")
-  x_train <- x_train[-na_idx_train, ]
-  y_train <- y_train[-na_idx_train]
-}
-
-if (length(na_idx_test) > 0) {
-  message("   Removing ", length(na_idx_test), " test samples with missing age")
-  x_test <- x_test[-na_idx_test, ]
-  y_test <- y_test[-na_idx_test]
-}
-
-#=== FEATURE SELECTION =======================================================
-
-message("\n")
-message("FEATURE SELECTION (GRADIENT-BASED IMPORTANCE)")
-message("=========================================================================\n")
-
-message(" + Fitting initial model for feature importance calculation...\n")
-
-# Fit a simple scorcher model to get gradient-based importance
-# This will take a moment...
-
-# For now, we'll use a simpler variance-based approach as default
-# with option to use gradient method when feasible
-
-message(" + Computing CpG variance for feature importance ranking...\n")
-
-cpg_variance <- apply(x_train, 2, var, na.rm = TRUE)
-top_cpg_idx  <- order(cpg_variance, decreasing = TRUE)[1:1000]
-
-message("   - Total CpGs available: ", ncol(x_train))
-message("   - Top 1000 CpGs selected")
-message("   - Variance range (top)  : ", 
-        round(min(cpg_variance[top_cpg_idx]), 6), 
-        " - ",
-        round(max(cpg_variance[top_cpg_idx]), 6))
-message("\n")
-
-# Subset data to top CpGs
-x_train_sel <- x_train[, top_cpg_idx]
-x_test_sel  <- x_test[, top_cpg_idx]
-
-message(" + Feature selection complete.")
-message("   - Training set: ", nrow(x_train_sel), " samples x ", 
-        ncol(x_train_sel), " selected CpGs")
-message("   - Test set:     ", nrow(x_test_sel), " samples x ", 
-        ncol(x_test_sel), " selected CpGs")
-message("\n")
-
-#=== ELASTIC NET BASELINE MODEL =============================================
-
-message("\n")
-message("ELASTIC NET BASELINE MODEL")
-message("=========================================================================\n")
-
-message(" + Training elastic net with 5-fold cross-validation...\n")
-
-# Prepare data for glmnet
-X_train_matrix <- as.matrix(x_train_sel)
-y_train_vector <- as.numeric(y_train)
-
-# Set seed for reproducibility
-set.seed(42)
-
-# Cross-validation with alpha parameter tuning
-# We'll test a few alpha values (balance between L1 and L2)
-alpha_values <- c(0.1, 0.5, 0.9)  # 0.1 = more L2, 0.9 = more L1
-best_alpha <- NA_real_
-best_mse <- Inf
-cv_results_list <- list()
-
-for (alpha in alpha_values) {
-  message("   Testing alpha = ", alpha, "...")
-  
-  cv_fit <- cv.glmnet(
-    X_train_matrix,
-    y_train_vector,
-    alpha = alpha,
-    nfolds = 5,
-    type.measure = "mse",
-    standardize = TRUE,
-    parallel = FALSE
-  )
-  
-  best_mse_alpha <- cv_fit$cvm[which.min(cv_fit$cvm)]
-  
-  if (best_mse_alpha < best_mse) {
-    best_mse <- best_mse_alpha
-    best_alpha <- alpha
+for (pkg in cran_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg)
   }
-  
-  cv_results_list[[as.character(alpha)]] <- cv_fit
 }
 
-message("   - Best alpha: ", best_alpha)
-message("   - Best CV MSE: ", round(best_mse, 4))
-message("\n")
-
-# Fit final elastic net model with best alpha
-en_final <- glmnet(
-  X_train_matrix,
-  y_train_vector,
-  alpha = best_alpha,
-  standardize = TRUE
-)
-
-# Get predictions using 1 SE rule (more conservative)
-lambda_1se <- cv_results_list[[as.character(best_alpha)]]$lambda.1se
-
-message(" + Elastic Net Model Summary:")
-message("   - Alpha (L1/L2 balance):  ", best_alpha)
-message("   - Lambda (regularization): ", round(lambda_1se, 6))
-message("   - Standardized features:  Yes")
-
-# Predictions on training set
-en_pred_train <- predict(en_final, newx = X_train_matrix, s = lambda_1se)[, 1]
-
-# Predictions on test set
-X_test_matrix <- as.matrix(x_test_sel)
-en_pred_test <- predict(en_final, newx = X_test_matrix, s = lambda_1se)[, 1]
-
-# Elastic net evaluation
-en_metrics_train <- data.frame(
-  model = "Elastic Net",
-  set = "Training",
-  mae = mean(abs(en_pred_train - y_train_vector), na.rm = TRUE),
-  rmse = sqrt(mean((en_pred_train - y_train_vector)^2, na.rm = TRUE)),
-  r2 = cor(en_pred_train, y_train_vector, use = "complete.obs")^2,
-  pearson_r = cor(en_pred_train, y_train_vector, use = "complete.obs")
-)
-
-y_test_vector <- as.numeric(y_test)
-
-en_metrics_test <- data.frame(
-  model = "Elastic Net",
-  set = "Test",
-  mae = mean(abs(en_pred_test - y_test_vector), na.rm = TRUE),
-  rmse = sqrt(mean((en_pred_test - y_test_vector)^2, na.rm = TRUE)),
-  r2 = cor(en_pred_test, y_test_vector, use = "complete.obs")^2,
-  pearson_r = cor(en_pred_test, y_test_vector, use = "complete.obs")
-)
-
-en_metrics <- rbind(en_metrics_train, en_metrics_test)
-
-message("   - Training MAE: ", round(en_metrics_train$mae, 3), " years")
-message("   - Test MAE:     ", round(en_metrics_test$mae, 3), " years")
-message("\n")
-
-# Save elastic net model
-qs_save(en_final, fs::path(DIR_OUT, "elasticnet_final_model.qs"))
-message(" + Elastic net model saved to elasticnet_final_model.qs\n")
-
-#=== SCORCHER NEURAL NETWORK HYPERPARAMETER TUNING ==========================
-
-message("\n")
-message("SCORCHER NEURAL NETWORK - HYPERPARAMETER TUNING")
-message("=========================================================================\n")
-
-message("NOTE: Scorcher model training currently under development.")
-message("This section provides the framework for hyperparameter tuning.\n")
-
-# Define hyperparameter grid based on case study specifications
-hyperparam_grid <- expand.grid(
-  learning_rate = c(1e-3, 1e-4, 1e-5),
-  dropout_rate = c(0.1, 0.3, 0.5),
-  l2_weight_decay = c(1e-2, 1e-3, 1e-4),
-  batch_size = c(32, 64, 128),
-  stringsAsFactors = FALSE
-)
-
-message(" + Hyperparameter grid for tuning:")
-message("   - Learning rate: 1e-3, 1e-4, 1e-5")
-message("   - Dropout rate: 0.1, 0.3, 0.5")
-message("   - L2 weight decay: 1e-2, 1e-3, 1e-4")
-message("   - Batch size: 32, 64, 128")
-message("   - Total configurations: ", nrow(hyperparam_grid))
-message("\n")
-
-# Save grid for reference
-readr::write_csv(hyperparam_grid, 
-  fs::path(DIR_OUT, "scorcher_hyperparam_grid.csv"))
-
-message(" + Hyperparameter grid saved to scorcher_hyperparam_grid.csv\n")
-
-# Ensure torch and scorcher packages are available
 if (!requireNamespace("torch", quietly = TRUE)) {
-  message("   Installing torch...")
-  utils::install.packages("torch", quietly = TRUE)
+  install.packages("torch")
+}
+
+if (!requireNamespace("pak", quietly = TRUE)) {
+  install.packages("pak")
 }
 
 if (!requireNamespace("scorcher", quietly = TRUE)) {
-  message("   Installing scorcher from GitHub...")
-  if (!requireNamespace("pak", quietly = TRUE)) {
-    utils::install.packages("pak")
-  }
-  pak::pak("jtleek/scorcher")
+  pak::pak("jtleek/scorcher@ssupdates")
 }
 
+library(qs2)
 library(torch)
 library(scorcher)
 
-message("   Loaded torch and scorcher packages\n")
+# Paper-reported final model settings.
+n_features <- 1000L
+paper_hidden_units <- 512L
+paper_n_hidden_layers <- 4L
+paper_activation <- "elu"
+paper_optimizer <- "adam"
+paper_dropout <- 0.30
+paper_l2 <- 1e-3
+paper_learning_rate <- 1e-4
 
-# Prepare data as torch tensors
-message(" + Converting training data to torch tensors...")
+# Runtime settings. The full DeepMAge grid is large, so demo mode evaluates a
+# representative subset by default while still writing the complete grid.
+batch_size <- 64L
+feature_epochs <- 50L
+tuning_epochs <- 50L
+final_epochs <- 200L
+cv_folds <- 5L
+tuning_mode <- tolower(Sys.getenv("DEEPMAGE_TUNING_MODE", "demo"))
+tuning_max_configs <- as.integer(Sys.getenv("DEEPMAGE_TUNING_MAX_CONFIGS", "12"))
+if (is.na(tuning_max_configs)) tuning_max_configs <- 12L
 
-X_train_tensor <- torch_tensor(as.matrix(x_train_sel), dtype = torch_float())
-y_train_tensor <- torch_tensor(as.numeric(y_train), dtype = torch_float())$unsqueeze(2)
+#=== LOAD DATA =================================================================
 
-# Initialize results storage
-message(" + Setting up hyperparameter tuning framework...\n")
+message("Loading ", data_path)
+obj <- qs2::qs_read(data_path)
 
-tuning_results_list <- list()
-best_mean_mae <- Inf
-best_config_idx <- NA_integer_
+x_train <- obj$x_train
+x_test <- obj$x_test
+y_train <- as.numeric(obj$y_train)
+y_test <- as.numeric(obj$y_test)
+pheno_train <- obj$pheno_train
+pheno_test <- obj$pheno_test
 
-# Create 5-fold CV indices  
-set.seed(42)
-n_samples <- nrow(X_train_tensor)
-fold_indices <- caret::createFolds(y_train, k = 5, list = FALSE)
-
-message("PERFORMING HYPERPARAMETER TUNING:\n")
-message("Total configurations to evaluate: ", nrow(hyperparam_grid), "\n")
-
-# Loop through each hyperparameter combination
-for (config_idx in seq_len(nrow(hyperparam_grid))) {
-  
-  current_config <- hyperparam_grid[config_idx, ]
-  
-  message("Configuration ", config_idx, "/", nrow(hyperparam_grid), 
-          " - LR: ", current_config$learning_rate,
-          ", Dropout: ", current_config$dropout_rate,
-          ", Batch: ", current_config$batch_size)
-  
-  # Storage for fold results
-  fold_maes <- numeric(5)
-  
-  # Perform 5-fold cross-validation
-  for (fold in 1:5) {
-    
-    # Split data: use fold as validation, others as training
-    val_idx <- which(fold_indices == fold)
-    train_idx <- which(fold_indices != fold)
-    
-    X_fold_train <- X_train_tensor[train_idx, ]
-    y_fold_train <- y_train_tensor[train_idx, ]
-    X_fold_val <- X_train_tensor[val_idx, ]
-    y_fold_val <- y_train_tensor[val_idx, ]
-    
-    # Create dataloader for this fold
-    dl_fold <- scorch_create_dataloader(
-      X_fold_train, y_fold_train,
-      batch_size = as.integer(current_config$batch_size)
-    )
-    
-    # Build model architecture
-    # Network: input -> FC(128) -> ReLU -> Dropout -> FC(64) -> ReLU -> Dropout -> FC(1)
-    scorch_model <- initiate_scorch(dl_fold) |>
-      scorch_input("x") |>
-      scorch_layer("fc1", "linear", in_features = ncol(x_train_sel), out_features = 128) |>
-      scorch_layer("act1", "relu") |>
-      scorch_dropout("drop1", p = current_config$dropout_rate) |>
-      scorch_layer("fc2", "linear", in_features = 128, out_features = 64) |>
-      scorch_layer("act2", "relu") |>
-      scorch_dropout("drop2", p = current_config$dropout_rate) |>
-      scorch_layer("fc_out", "linear", in_features = 64, out_features = 1) |>
-      scorch_output("fc_out")
-    
-    # Compile model with current hyperparameters
-    scorch_model <- scorch_model |>
-      compile_scorch(
-        loss_fn = nn_l1_loss(reduction = "mean"),  # MAE loss
-        optimizer_fn = optim_adam,
-        optimizer_params = list(
-          lr = current_config$learning_rate,
-          weight_decay = current_config$l2_weight_decay
-        )
-      )
-    
-    # Train the model
-    scorch_model <- scorch_model |>
-      fit_scorch(num_epochs = 100, verbose = FALSE)
-    
-    # Evaluate on validation fold
-    scorch_model$nn_model$eval()
-    
-    with_no_grad({
-      y_val_pred <- scorch_model$nn_model(X_fold_val)
-      y_val_pred <- as.numeric(y_val_pred$squeeze())
-    })
-    
-    # Calculate MAE for this fold
-    fold_mae <- mean(abs(y_val_pred - as.numeric(y_fold_val)))
-    fold_maes[fold] <- fold_mae
-    
-    rm(scorch_model)  # Free memory
-  }
-  
-  # Calculate mean and SD across folds
-  mean_mae <- mean(fold_maes)
-  sd_mae <- sd(fold_maes)
-  
-  # Store results
-  tuning_results_list[[config_idx]] <- data.frame(
-    config_idx = config_idx,
-    learning_rate = current_config$learning_rate,
-    dropout_rate = current_config$dropout_rate,
-    l2_weight_decay = current_config$l2_weight_decay,
-    batch_size = current_config$batch_size,
-    fold_1_mae = fold_maes[1],
-    fold_2_mae = fold_maes[2],
-    fold_3_mae = fold_maes[3],
-    fold_4_mae = fold_maes[4],
-    fold_5_mae = fold_maes[5],
-    mean_mae = mean_mae,
-    sd_mae = sd_mae
-  )
-  
-  message("   Mean CV MAE: ", round(mean_mae, 3), " years (SD: ", 
-          round(sd_mae, 3), ")")
-  
-  # Track best configuration
-  if (mean_mae < best_mean_mae) {
-    best_mean_mae <- mean_mae
-    best_config_idx <- config_idx
-  }
+if (!"is_control" %in% names(pheno_train)) {
+  pheno_train$is_control <- NA
 }
 
-message("\n")
+if (!"is_control" %in% names(pheno_test)) {
+  pheno_test$is_control <- NA
+}
 
-# Combine results into dataframe
-tuning_results <- do.call(rbind, tuning_results_list)
+keep_train <- !is.na(y_train)
+keep_test <- !is.na(y_test)
 
-# Get best configuration
-best_config <- hyperparam_grid[best_config_idx, ]
+x_train <- x_train[keep_train, , drop = FALSE]
+y_train <- y_train[keep_train]
+pheno_train <- pheno_train[keep_train, , drop = FALSE]
 
-message("BEST HYPERPARAMETER CONFIGURATION:")
-message("  Learning Rate: ", best_config$learning_rate)
-message("  Dropout Rate: ", best_config$dropout_rate)
-message("  L2 Weight Decay: ", best_config$l2_weight_decay)
-message("  Batch Size: ", best_config$batch_size)
-message("  Mean CV MAE: ", round(best_mean_mae, 3), " years")
-message("\n")
+x_test <- x_test[keep_test, , drop = FALSE]
+y_test <- y_test[keep_test]
+pheno_test <- pheno_test[keep_test, , drop = FALSE]
 
-# Save tuning results
-readr::write_csv(tuning_results,
-  fs::path(DIR_OUT, "scorcher_tuning_results.csv"))
+message("Training data: ", nrow(x_train), " samples x ", ncol(x_train), " CpGs")
+message("Test data:     ", nrow(x_test), " samples x ", ncol(x_test), " CpGs")
 
-message(" + Tuning results saved to scorcher_tuning_results.csv\n")
+#=== STANDARDIZE FEATURES ======================================================
 
-# Train final model with best hyperparameters on full training set
-message("TRAINING FINAL MODEL WITH BEST HYPERPARAMETERS\n")
+message("\nStandardizing CpGs using training-set means and SDs")
 
-message(" + Creating dataloader for full training set...")
+train_center <- colMeans(x_train, na.rm = TRUE)
+train_scale <- apply(x_train, 2, stats::sd, na.rm = TRUE)
+train_scale[is.na(train_scale) | train_scale == 0] <- 1
 
-dl_final <- scorch_create_dataloader(
-  X_train_tensor, y_train_tensor,
-  batch_size = as.integer(best_config$batch_size)
+x_train_z <- sweep(x_train, 2, train_center, "-")
+x_train_z <- sweep(x_train_z, 2, train_scale, "/")
+
+x_test_z <- sweep(x_test, 2, train_center, "-")
+x_test_z <- sweep(x_test_z, 2, train_scale, "/")
+
+#=== FEATURE SELECTION MODEL ===================================================
+
+message("\nSelecting 1,000 CpGs by input-gradient magnitude")
+message("Fitting the initial scorcher model used only for feature ranking")
+
+x_feature_tensor <- torch_tensor(as.matrix(x_train_z), dtype = torch_float())
+y_feature_tensor <- torch_tensor(y_train, dtype = torch_float())$unsqueeze(2)
+
+dl_feature <- scorch_create_dataloader(
+  x_feature_tensor,
+  y_feature_tensor,
+  batch_size = batch_size
 )
 
-message(" + Building scorcher model with best configuration...")
-
-scorcher_final <- initiate_scorch(dl_final) |>
-  scorch_input("x") |>
-  scorch_layer("fc1", "linear", in_features = ncol(x_train_sel), out_features = 128) |>
-  scorch_layer("act1", "relu") |>
-  scorch_dropout("drop1", p = best_config$dropout_rate) |>
-  scorch_layer("fc2", "linear", in_features = 128, out_features = 64) |>
-  scorch_layer("act2", "relu") |>
-  scorch_dropout("drop2", p = best_config$dropout_rate) |>
-  scorch_layer("fc_out", "linear", in_features = 64, out_features = 1) |>
-  scorch_output("fc_out")
-
-message(" + Compiling model...")
-
-scorcher_final <- scorcher_final |>
+feature_fit <- initiate_scorch(dl_feature) |>
+  scorch_input(features) |>
+  scorch_layer(linear, in_features = ncol(x_train_z), out_features = 512) |>
+  scorch_layer(elu) |>
+  scorch_dropout(p = 0.30) |>
+  scorch_layer(linear, in_features = 512, out_features = 512) |>
+  scorch_layer(elu) |>
+  scorch_dropout(p = 0.30) |>
+  scorch_layer(linear, in_features = 512, out_features = 512) |>
+  scorch_layer(elu) |>
+  scorch_dropout(p = 0.30) |>
+  scorch_layer(linear, in_features = 512, out_features = 512) |>
+  scorch_layer(elu) |>
+  scorch_dropout(p = 0.30) |>
+  scorch_layer(linear, in_features = 512, out_features = 1, .name = prediction) |>
+  scorch_output(prediction) |>
   compile_scorch(
     loss_fn = nn_l1_loss(reduction = "mean"),
     optimizer_fn = optim_adam,
     optimizer_params = list(
-      lr = best_config$learning_rate,
-      weight_decay = best_config$l2_weight_decay
+      lr = paper_learning_rate,
+      weight_decay = paper_l2
     )
-  )
+  ) |>
+  fit_scorch(num_epochs = feature_epochs, seed = 1L)
 
-message(" + Training final model (100 epochs)...\n")
+feature_fit$nn_model$eval()
+x_gradient_tensor <- torch_tensor(as.matrix(x_train_z), dtype = torch_float())
+x_gradient_tensor$requires_grad_(TRUE)
 
-scorcher_final <- scorcher_final |>
-  fit_scorch(num_epochs = 100, verbose = FALSE)
+gradient_predictions <- feature_fit$nn_model(x_gradient_tensor)
+gradient_predictions$sum()$backward()
 
-message("Final model training complete\n")
+gradient_matrix <- as_array(x_gradient_tensor$grad)
+gradient_importance <- colMeans(abs(gradient_matrix), na.rm = TRUE)
+feature_rank <- order(gradient_importance, decreasing = TRUE, na.last = NA)
+feature_idx <- feature_rank[seq_len(min(n_features, length(feature_rank)))]
+selected_features <- colnames(x_train_z)[feature_idx]
 
-# Make predictions on training and test sets
-message("GENERATING FINAL PREDICTIONS\n")
-
-scorcher_final$nn_model$eval()
-
-with_no_grad({
-  # Training set predictions
-  y_pred_scorch_train <- scorcher_final$nn_model(X_train_tensor)
-  y_pred_scorch_train <- as.numeric(y_pred_scorch_train$squeeze())
-  
-  # Test set predictions
-  X_test_tensor <- torch_tensor(as.matrix(x_test_sel), dtype = torch_float())
-  y_pred_scorch_test <- scorcher_final$nn_model(X_test_tensor)
-  y_pred_scorch_test <- as.numeric(y_pred_scorch_test$squeeze())
-})
-
-# Calculate metrics
-y_test_vector <- as.numeric(y_test)
-
-scorch_metrics_train <- data.frame(
-  model = "Scorcher NN",
-  set = "Training",
-  mae = mean(abs(y_pred_scorch_train - as.numeric(y_train_vector)), na.rm = TRUE),
-  rmse = sqrt(mean((y_pred_scorch_train - as.numeric(y_train_vector))^2, na.rm = TRUE)),
-  r2 = cor(y_pred_scorch_train, as.numeric(y_train_vector), use = "complete.obs")^2,
-  pearson_r = cor(y_pred_scorch_train, as.numeric(y_train_vector), use = "complete.obs")
+feature_tbl <- tibble::tibble(
+  cpg = selected_features,
+  gradient_importance = gradient_importance[feature_idx],
+  rank = seq_along(selected_features)
 )
 
-scorch_metrics_test <- data.frame(
-  model = "Scorcher NN",
-  set = "Test",
-  mae = mean(abs(y_pred_scorch_test - y_test_vector), na.rm = TRUE),
-  rmse = sqrt(mean((y_pred_scorch_test - y_test_vector)^2, na.rm = TRUE)),
-  r2 = cor(y_pred_scorch_test, y_test_vector, use = "complete.obs")^2,
-  pearson_r = cor(y_pred_scorch_test, y_test_vector, use = "complete.obs")
+readr::write_csv(feature_tbl, fs::path(DIR_OUT, "deepmage_selected_cpgs.csv"))
+qs2::qs_save(feature_tbl, fs::path(DIR_OUT, "deepmage_selected_cpgs.qs"))
+
+x_train_sel <- x_train_z[, selected_features, drop = FALSE]
+x_test_sel <- x_test_z[, selected_features, drop = FALSE]
+
+message("Selected CpGs: ", ncol(x_train_sel))
+
+#=== HYPERPARAMETER GRID =======================================================
+
+message("\nBuilding DeepMAge paper-range hyperparameter grid")
+
+paper_grid <- expand.grid(
+  n_hidden_layers = 2:5,
+  hidden_units = seq(128L, 1024L, by = 128L),
+  activation = c("elu", "relu", "selu"),
+  optimizer = c("adam", "amsgrad", "nadam"),
+  dropout = seq(0.15, 0.50, by = 0.05),
+  l2 = c(1e-6, 1e-5, 1e-4, 1e-3, 1e-2, 1e-1),
+  learning_rate = paper_learning_rate,
+  stringsAsFactors = FALSE
 )
 
-scorch_metrics <- rbind(scorch_metrics_train, scorch_metrics_test)
-
-message("   - Training MAE: ", round(scorch_metrics_train$mae, 3), " years")
-message("   - Test MAE:     ", round(scorch_metrics_test$mae, 3), " years")
-message("\n")
-
-# Save final model
-torch_save(scorcher_final$nn_model, 
-           fs::path(DIR_OUT, "scorcher_final_model.pt"))
-qs_save(scorcher_final, 
-        fs::path(DIR_OUT, "scorcher_final_model.qs"))
-
-message(" + Scorcher model saved\n")
-
-#=== MODEL COMPARISON ========================================================
-
-message("\n")
-message("MODEL COMPARISON AND FINAL EVALUATION")
-message("=========================================================================\n")
-
-message("ELASTIC NET MODEL PERFORMANCE:\n")
-
-print(en_metrics)
-
-message("\n")
-message("Elastic Net Training MAE:  ", round(en_metrics_train$mae, 3), " years")
-message("Elastic Net Test MAE:      ", round(en_metrics_test$mae, 3), " years")
-message("Elastic Net Test R-squared: ", round(en_metrics_test$r2, 4))
-message("Elastic Net Test Correlation: ", round(en_metrics_test$pearson_r, 4))
-
-message("\n")
-message("SCORCHER NEURAL NETWORK PERFORMANCE:\n")
-
-print(scorch_metrics)
-
-message("\n")
-message("Scorcher NN Training MAE:  ", round(scorch_metrics_train$mae, 3), " years")
-message("Scorcher NN Test MAE:      ", round(scorch_metrics_test$mae, 3), " years")
-message("Scorcher NN Test R-squared: ", round(scorch_metrics_test$r2, 4))
-message("Scorcher NN Test Correlation: ", round(scorch_metrics_test$pearson_r, 4))
-
-message("\n")
-message("MODEL COMPARISON:")
-message("  Elastic Net Test MAE:  ", round(en_metrics_test$mae, 3), " years")
-message("  Scorcher NN Test MAE:  ", round(scorch_metrics_test$mae, 3), " years")
-message("  Improvement (MAE):     ", round(en_metrics_test$mae - scorch_metrics_test$mae, 3), " years")
-message("  ")
-message("  Elastic Net Test R-squared: ", round(en_metrics_test$r2, 4))
-message("  Scorcher NN Test R-squared: ", round(scorch_metrics_test$r2, 4))
-message("  Improvement (R-squared):    ", round(scorch_metrics_test$r2 - en_metrics_test$r2, 4))
-message("\n")
-
-#=== SAVE EVALUATION RESULTS =================================================
-
-message("\nSAVING EVALUATION RESULTS\n")
-
-# Combine metrics from both models
-all_metrics <- rbind(en_metrics, scorch_metrics)
-
-# Save comparison results
-qs_save(all_metrics, fs::path(DIR_OUT, "model_comparison_results.qs"))
-readr::write_csv(all_metrics, fs::path(DIR_OUT, "model_comparison_results.csv"))
-
-message(" + Comparison results saved\n")
-
-# Save predictions from both models
-predictions_df <- data.frame(
-  age_true = y_test_vector,
-  en_predicted = en_pred_test,
-  en_residual = en_pred_test - y_test_vector,
-  scorch_predicted = y_pred_scorch_test,
-  scorch_residual = y_pred_scorch_test - y_test_vector
-)
-
-qs_save(predictions_df, fs::path(DIR_OUT, "predictions_on_test_set.qs"))
-readr::write_csv(predictions_df, fs::path(DIR_OUT, "predictions_on_test_set.csv"))
-
-message(" + Predictions saved\n")
-
-#=== GENERATE DIAGNOSTIC PLOTS ===============================================
-
-message("GENERATING DIAGNOSTIC PLOTS\n")
-
-# Elastic Net predictions plot
-p_en <- predictions_df %>%
-  ggplot(aes(x = age_true, y = en_predicted)) +
-  geom_point(alpha = 0.6, size = 2, color = "steelblue") +
-  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
-  geom_smooth(method = "loess", se = TRUE, color = "blue", alpha = 0.2) +
-  labs(
-    title = "Elastic Net: Predictions vs Observed Age",
-    x = "Chronological Age (years)",
-    y = "Predicted Age (years)",
-    subtitle = paste0("Test MAE = ", 
-                      round(en_metrics_test$mae, 2), " years, R-squared = ",
-                      round(en_metrics_test$r2, 3))
-  ) +
-  theme_minimal() +
-  theme(
-    plot.title = element_text(size = 14, face = "bold"),
-    plot.subtitle = element_text(size = 11),
-    aspect.ratio = 1
+if (tuning_mode == "skip") {
+  tuning_grid <- paper_grid[0, , drop = FALSE]
+} else if (tuning_mode == "full") {
+  tuning_grid <- paper_grid
+} else {
+  best_default <- which(
+    paper_grid$n_hidden_layers == paper_n_hidden_layers &
+      paper_grid$hidden_units == paper_hidden_units &
+      paper_grid$activation == paper_activation &
+      paper_grid$optimizer == paper_optimizer &
+      abs(paper_grid$dropout - paper_dropout) < 1e-8 &
+      abs(paper_grid$l2 - paper_l2) < 1e-12
   )
 
-# Scorcher NN predictions plot
-p_scorch <- predictions_df %>%
-  ggplot(aes(x = age_true, y = scorch_predicted)) +
-  geom_point(alpha = 0.6, size = 2, color = "darkgreen") +
-  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
-  geom_smooth(method = "loess", se = TRUE, color = "orange", alpha = 0.2) +
-  labs(
-    title = "Scorcher NN: Predictions vs Observed Age",
-    x = "Chronological Age (years)",
-    y = "Predicted Age (years)",
-    subtitle = paste0("Test MAE = ", 
-                      round(scorch_metrics_test$mae, 2), " years, R-squared = ",
-                      round(scorch_metrics_test$r2, 3))
-  ) +
-  theme_minimal() +
-  theme(
-    plot.title = element_text(size = 14, face = "bold"),
-    plot.subtitle = element_text(size = 11),
-    aspect.ratio = 1
-  )
+  n_demo <- min(max(tuning_max_configs, 1L), nrow(paper_grid))
+  set.seed(1)
+  demo_idx <- unique(c(best_default[1], sample(seq_len(nrow(paper_grid)), n_demo - 1L)))
+  tuning_grid <- paper_grid[demo_idx, , drop = FALSE]
+}
 
-# Combine prediction plots
-p_pred_combined <- cowplot::plot_grid(p_en, p_scorch, ncol = 2)
+readr::write_csv(paper_grid, fs::path(DIR_OUT, "deepmage_full_hyperparameter_grid.csv"))
+readr::write_csv(tuning_grid, fs::path(DIR_OUT, "deepmage_tuning_grid.csv"))
 
-ggsave(fs::path(DIR_OUT, "model_predictions_comparison.png"),
-       p_pred_combined, width = 14, height = 6, dpi = 300)
+message("Full grid size: ", nrow(paper_grid), " configurations")
+message("Tuning mode: ", tuning_mode)
+message("Configurations to evaluate now: ", nrow(tuning_grid))
 
-message(" + Prediction comparison plot saved: model_predictions_comparison.png\n")
+#=== HYPERPARAMETER TUNING =====================================================
 
-# Elastic Net residuals plot
-p_resid <- predictions_df %>%
-  ggplot(aes(x = age_true, y = en_residual)) +
-  geom_point(alpha = 0.6, size = 2) +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-  geom_smooth(method = "loess", se = TRUE, color = "blue", alpha = 0.2) +
-  labs(
-    title = "Elastic Net Prediction Residuals",
-    x = "Chronological Age (years)",
-    y = "Residual (Predicted - Observed, years)"
-  ) +
-  theme_minimal() +
-  theme(
-    plot.title = element_text(size = 14, face = "bold"),
-    aspect.ratio = 1
-  )
+tuning_results <- tuning_grid
 
-# Scorcher NN residuals plot
-p_resid_scorch <- predictions_df %>%
-  ggplot(aes(x = age_true, y = scorch_residual)) +
-  geom_point(alpha = 0.6, size = 2, color = "darkgreen") +
-  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
-  geom_smooth(method = "loess", se = TRUE, color = "orange", alpha = 0.2) +
-  labs(
-    title = "Scorcher NN Prediction Residuals",
-    x = "Chronological Age (years)",
-    y = "Residual (Predicted - Observed, years)"
-  ) +
-  theme_minimal() +
-  theme(
-    plot.title = element_text(size = 14, face = "bold"),
-    aspect.ratio = 1
-  )
+if (nrow(tuning_grid) > 0) {
+  tuning_results$n_folds <- NA_integer_
+  tuning_results$mean_mae <- NA_real_
+  tuning_results$mean_medae <- NA_real_
+  tuning_results$status <- NA_character_
 
-# Combine residual plots
-p_resid_combined <- cowplot::plot_grid(p_resid, p_resid_scorch, ncol = 2)
+  set.seed(1)
+  k <- min(cv_folds, nrow(x_train_sel))
+  fold_id <- sample(rep(seq_len(k), length.out = nrow(x_train_sel)))
 
-ggsave(fs::path(DIR_OUT, "model_residuals_comparison.png"),
-       p_resid_combined, width = 14, height = 6, dpi = 300)
+  for (config_i in seq_len(nrow(tuning_grid))) {
+    current <- tuning_grid[config_i, , drop = FALSE]
 
-message(" + Residuals comparison plot saved: model_residuals_comparison.png\n")
+    current_n_hidden_layers <- as.integer(current$n_hidden_layers)
+    current_hidden_units <- as.integer(current$hidden_units)
+    current_activation <- as.character(current$activation)
+    current_optimizer <- as.character(current$optimizer)
+    current_dropout <- as.numeric(current$dropout)
+    current_l2 <- as.numeric(current$l2)
+    current_learning_rate <- as.numeric(current$learning_rate)
 
-#=== SUMMARY AND NEXT STEPS ==================================================
+    message(
+      "  config ", config_i, "/", nrow(tuning_grid),
+      ": layers=", current_n_hidden_layers,
+      ", units=", current_hidden_units,
+      ", activation=", current_activation,
+      ", optimizer=", current_optimizer,
+      ", dropout=", current_dropout,
+      ", l2=", current_l2
+    )
 
-message("\n")
-message("===============================================================================")
-message("TRAINING COMPLETE")
-message("===============================================================================\n")
+    current_optimizer_params <- list(
+      lr = current_learning_rate,
+      weight_decay = current_l2
+    )
 
-message("SUMMARY OF RESULTS:\n")
+    current_optimizer_fn <- optim_adam
+    current_status <- "ok"
 
-message("Elastic Net Model (Baseline):")
-message("  - Training MAE:  ", round(en_metrics_train$mae, 3), " years")
-message("  - Test MAE:      ", round(en_metrics_test$mae, 3), " years")
-message("  - Test RMSE:     ", round(en_metrics_test$rmse, 3), " years")
-message("  - Test R-squared: ", round(en_metrics_test$r2, 4))
-message("  - Test Correlation: ", round(en_metrics_test$pearson_r, 4))
-message("\n")
-
-message("Scorcher Neural Network:")
-message("  - Training MAE:  ", round(scorch_metrics_train$mae, 3), " years")
-message("  - Test MAE:      ", round(scorch_metrics_test$mae, 3), " years")
-message("  - Test RMSE:     ", round(scorch_metrics_test$rmse, 3), " years")
-message("  - Test R-squared: ", round(scorch_metrics_test$r2, 4))
-message("  - Test Correlation: ", round(scorch_metrics_test$pearson_r, 4))
-message("  - Best hyperparams: LR=", best_config$learning_rate, 
-        ", Dropout=", best_config$dropout_rate,
-        ", BatchSize=", best_config$batch_size)
-message("\n")
-
-message("COMPARISON:")
-message("  MAE Improvement: ", round(en_metrics_test$mae - scorch_metrics_test$mae, 3), " years")
-message("  R-squared Improvement: ", round(scorch_metrics_test$r2 - en_metrics_test$r2, 4))
-message("\n")
-
-message("OUTPUT FILES GENERATED:\n")
-
-output_files <- c(
-  "elasticnet_final_model.qs",
-  "scorcher_final_model.qs",
-  "scorcher_final_model.pt",
-  "scorcher_hyperparam_grid.csv",
-  "scorcher_tuning_results.csv",
-  "model_comparison_results.qs",
-  "model_comparison_results.csv",
-  "predictions_on_test_set.qs",
-  "predictions_on_test_set.csv",
-  "model_predictions_comparison.png",
-  "model_residuals_comparison.png"
-)
-
-for (file in output_files) {
-  path <- fs::path(DIR_OUT, file)
-  if (file.exists(path)) {
-    size <- file.size(path)
-    if (size > 1024^2) {
-      size_str <- paste0(round(size / 1024^2, 1), " MB")
-    } else if (size > 1024) {
-      size_str <- paste0(round(size / 1024, 1), " KB")
-    } else {
-      size_str <- paste0(size, " B")
+    if (current_optimizer == "amsgrad") {
+      current_optimizer_params$amsgrad <- TRUE
     }
-    message("  (saved) ", file, " (", size_str, ")")
+
+    if (current_optimizer == "nadam") {
+      if (exists("optim_nadam", envir = asNamespace("torch"))) {
+        current_optimizer_fn <- get("optim_nadam", envir = asNamespace("torch"))
+      } else {
+        current_status <- "skipped_optimizer_unavailable"
+      }
+    }
+
+    fold_mae <- rep(NA_real_, k)
+    fold_medae <- rep(NA_real_, k)
+
+    if (current_status == "ok") {
+      for (fold in seq_len(k)) {
+        val_idx <- which(fold_id == fold)
+        trn_idx <- which(fold_id != fold)
+
+        x_fold_train_tensor <- torch_tensor(
+          as.matrix(x_train_sel[trn_idx, , drop = FALSE]),
+          dtype = torch_float()
+        )
+        y_fold_train_tensor <- torch_tensor(
+          y_train[trn_idx],
+          dtype = torch_float()
+        )$unsqueeze(2)
+
+        dl_fold <- scorch_create_dataloader(
+          x_fold_train_tensor,
+          y_fold_train_tensor,
+          batch_size = batch_size
+        )
+
+        fold_model <- initiate_scorch(dl_fold) |>
+          scorch_input(features)
+
+        in_features <- ncol(x_train_sel)
+
+        for (layer_i in seq_len(current_n_hidden_layers)) {
+          fold_model <- fold_model |>
+            scorch_layer(
+              linear,
+              in_features = in_features,
+              out_features = current_hidden_units
+            )
+
+          if (current_activation == "elu") {
+            fold_model <- fold_model |>
+              scorch_layer(elu)
+          } else if (current_activation == "relu") {
+            fold_model <- fold_model |>
+              scorch_layer(relu)
+          } else if (current_activation == "selu") {
+            fold_model <- fold_model |>
+              scorch_layer(selu)
+          }
+
+          fold_model <- fold_model |>
+            scorch_dropout(p = current_dropout)
+
+          in_features <- current_hidden_units
+        }
+
+        fold_fit <- tryCatch({
+          fold_model |>
+            scorch_layer(
+              linear,
+              in_features = in_features,
+              out_features = 1,
+              .name = prediction
+            ) |>
+            scorch_output(prediction) |>
+            compile_scorch(
+              loss_fn = nn_l1_loss(reduction = "mean"),
+              optimizer_fn = current_optimizer_fn,
+              optimizer_params = current_optimizer_params
+            ) |>
+            fit_scorch(num_epochs = tuning_epochs, seed = 1L)
+        }, error = function(e) {
+          current_status <<- conditionMessage(e)
+          NULL
+        })
+
+        if (is.null(fold_fit)) {
+          break
+        }
+
+        fold_fit$nn_model$eval()
+        x_fold_val_tensor <- torch_tensor(
+          as.matrix(x_train_sel[val_idx, , drop = FALSE]),
+          dtype = torch_float()
+        )
+
+        with_no_grad({
+          fold_pred <- as.numeric(fold_fit$nn_model(x_fold_val_tensor)$squeeze())
+        })
+
+        fold_abs_error <- abs(fold_pred - y_train[val_idx])
+        fold_mae[fold] <- mean(fold_abs_error, na.rm = TRUE)
+        fold_medae[fold] <- stats::median(fold_abs_error, na.rm = TRUE)
+
+        rm(fold_fit)
+        gc()
+      }
+    }
+
+    tuning_results$n_folds[config_i] <- sum(!is.na(fold_mae))
+    tuning_results$mean_mae[config_i] <- mean(fold_mae, na.rm = TRUE)
+    tuning_results$mean_medae[config_i] <- mean(fold_medae, na.rm = TRUE)
+    tuning_results$status[config_i] <- current_status
   }
 }
 
-message("\n")
+readr::write_csv(tuning_results, fs::path(DIR_OUT, "deepmage_tuning_results.csv"))
+qs2::qs_save(tuning_results, fs::path(DIR_OUT, "deepmage_tuning_results.qs"))
 
-message("NEXT STEPS:\n")
-message("  1. Review hyperparameter tuning in scorcher_tuning_results.csv")
-message("  2. Compare elastic net vs scorcher NN in model_comparison_results.csv")
-message("  3. Examine prediction plots:")
-message("     - model_predictions_comparison.png")
-message("     - model_residuals_comparison.png")
-message("  4. Load predictions for further analysis:")
-message("     predictions <- qs_read('data/processed/predictions_on_test_set.qs')")
-message("  5. Load final models for deployment:")
-message("     en_model <- qs_read('data/processed/elasticnet_final_model.qs')")
-message("     scorch_model <- qs_read('data/processed/scorcher_final_model.qs')")
-message("  6. Run analysis.R for cooking show-style demonstration")
-message("\n")
+final_n_hidden_layers <- paper_n_hidden_layers
+final_hidden_units <- paper_hidden_units
+final_activation <- paper_activation
+final_optimizer <- paper_optimizer
+final_dropout <- paper_dropout
+final_l2 <- paper_l2
+final_learning_rate <- paper_learning_rate
 
-message("Done.\n")
+if ("status" %in% names(tuning_results)) {
+  usable_tuning <- tuning_results[
+    tuning_results$status == "ok" & is.finite(tuning_results$mean_mae),
+    ,
+    drop = FALSE
+  ]
+} else {
+  usable_tuning <- tuning_results[0, , drop = FALSE]
+}
 
-#=== END ====================================================================== 
+if (nrow(usable_tuning) > 0) {
+  best_i <- which.min(usable_tuning$mean_mae)
+  best_row <- usable_tuning[best_i, , drop = FALSE]
+
+  final_n_hidden_layers <- as.integer(best_row$n_hidden_layers)
+  final_hidden_units <- as.integer(best_row$hidden_units)
+  final_activation <- as.character(best_row$activation)
+  final_optimizer <- as.character(best_row$optimizer)
+  final_dropout <- as.numeric(best_row$dropout)
+  final_l2 <- as.numeric(best_row$l2)
+  final_learning_rate <- as.numeric(best_row$learning_rate)
+
+  message(
+    "Best tuned config: layers=", final_n_hidden_layers,
+    ", units=", final_hidden_units,
+    ", activation=", final_activation,
+    ", optimizer=", final_optimizer,
+    ", dropout=", final_dropout,
+    ", l2=", final_l2,
+    ", CV MAE=", round(best_row$mean_mae, 3)
+  )
+} else {
+  message("No usable tuning result; using paper's final reported configuration.")
+}
+
+#=== ELASTIC-NET BASELINE ======================================================
+
+message("\nTraining elastic-net baseline on selected CpGs")
+
+set.seed(1)
+cv_en <- glmnet::cv.glmnet(
+  as.matrix(x_train_sel),
+  y_train,
+  alpha = 0.5,
+  nfolds = cv_folds,
+  type.measure = "mae",
+  standardize = FALSE
+)
+
+en_pred_train <- as.numeric(predict(cv_en, as.matrix(x_train_sel), s = "lambda.1se"))
+en_pred_test <- as.numeric(predict(cv_en, as.matrix(x_test_sel), s = "lambda.1se"))
+
+#=== FINAL SCORCHER MODEL ======================================================
+
+message("\nTraining final scorcher DeepMAge-style model")
+
+final_optimizer_params <- list(
+  lr = final_learning_rate,
+  weight_decay = final_l2
+)
+
+final_optimizer_fn <- optim_adam
+
+if (final_optimizer == "amsgrad") {
+  final_optimizer_params$amsgrad <- TRUE
+}
+
+if (final_optimizer == "nadam" && exists("optim_nadam", envir = asNamespace("torch"))) {
+  final_optimizer_fn <- get("optim_nadam", envir = asNamespace("torch"))
+}
+
+x_final_train_tensor <- torch_tensor(as.matrix(x_train_sel), dtype = torch_float())
+y_final_train_tensor <- torch_tensor(y_train, dtype = torch_float())$unsqueeze(2)
+
+dl_final <- scorch_create_dataloader(
+  x_final_train_tensor,
+  y_final_train_tensor,
+  batch_size = batch_size
+)
+
+deepmage_model <- initiate_scorch(dl_final) |>
+  scorch_input(features)
+
+in_features <- ncol(x_train_sel)
+
+for (layer_i in seq_len(final_n_hidden_layers)) {
+  deepmage_model <- deepmage_model |>
+    scorch_layer(
+      linear,
+      in_features = in_features,
+      out_features = final_hidden_units
+    )
+
+  if (final_activation == "elu") {
+    deepmage_model <- deepmage_model |>
+      scorch_layer(elu)
+  } else if (final_activation == "relu") {
+    deepmage_model <- deepmage_model |>
+      scorch_layer(relu)
+  } else if (final_activation == "selu") {
+    deepmage_model <- deepmage_model |>
+      scorch_layer(selu)
+  }
+
+  deepmage_model <- deepmage_model |>
+    scorch_dropout(p = final_dropout)
+
+  in_features <- final_hidden_units
+}
+
+deepmage_fit <- deepmage_model |>
+  scorch_layer(linear, in_features = in_features, out_features = 1, .name = prediction) |>
+  scorch_output(prediction) |>
+  compile_scorch(
+    loss_fn = nn_l1_loss(reduction = "mean"),
+    optimizer_fn = final_optimizer_fn,
+    optimizer_params = final_optimizer_params
+  ) |>
+  fit_scorch(num_epochs = final_epochs, seed = 1L)
+
+deepmage_fit$nn_model$eval()
+
+with_no_grad({
+  dm_pred_train <- as.numeric(deepmage_fit$nn_model(x_final_train_tensor)$squeeze())
+
+  x_final_test_tensor <- torch_tensor(as.matrix(x_test_sel), dtype = torch_float())
+  dm_pred_test <- as.numeric(deepmage_fit$nn_model(x_final_test_tensor)$squeeze())
+})
+
+#=== METRICS AND OUTPUTS =======================================================
+
+metrics <- tibble::tibble()
+
+metric_sets <- list(
+  list(model = "Elastic Net", set = "train", truth = y_train, pred = en_pred_train, pheno = pheno_train),
+  list(model = "Elastic Net", set = "test", truth = y_test, pred = en_pred_test, pheno = pheno_test),
+  list(model = "Scorcher DeepMAge", set = "train", truth = y_train, pred = dm_pred_train, pheno = pheno_train),
+  list(model = "Scorcher DeepMAge", set = "test", truth = y_test, pred = dm_pred_test, pheno = pheno_test)
+)
+
+for (metric_i in seq_along(metric_sets)) {
+  current_metric <- metric_sets[[metric_i]]
+
+  idx <- seq_along(current_metric$truth)
+  truth_i <- current_metric$truth[idx]
+  pred_i <- current_metric$pred[idx]
+
+  metrics <- rbind(
+    metrics,
+    tibble::tibble(
+      model = current_metric$model,
+      set = current_metric$set,
+      cohort = "all",
+      n = length(truth_i),
+      medae = stats::median(abs(pred_i - truth_i), na.rm = TRUE),
+      mae = mean(abs(pred_i - truth_i), na.rm = TRUE),
+      rmse = sqrt(mean((pred_i - truth_i)^2, na.rm = TRUE)),
+      pearson_r = stats::cor(pred_i, truth_i, use = "complete.obs"),
+      r2 = 1 - sum((truth_i - pred_i)^2, na.rm = TRUE) /
+        sum((truth_i - mean(truth_i, na.rm = TRUE))^2, na.rm = TRUE)
+    )
+  )
+
+  idx <- which(current_metric$pheno$is_control %in% TRUE)
+
+  if (length(idx) > 1) {
+    truth_i <- current_metric$truth[idx]
+    pred_i <- current_metric$pred[idx]
+
+    metrics <- rbind(
+      metrics,
+      tibble::tibble(
+        model = current_metric$model,
+        set = current_metric$set,
+        cohort = "controls",
+        n = length(truth_i),
+        medae = stats::median(abs(pred_i - truth_i), na.rm = TRUE),
+        mae = mean(abs(pred_i - truth_i), na.rm = TRUE),
+        rmse = sqrt(mean((pred_i - truth_i)^2, na.rm = TRUE)),
+        pearson_r = stats::cor(pred_i, truth_i, use = "complete.obs"),
+        r2 = 1 - sum((truth_i - pred_i)^2, na.rm = TRUE) /
+          sum((truth_i - mean(truth_i, na.rm = TRUE))^2, na.rm = TRUE)
+      )
+    )
+  }
+}
+
+predictions <- rbind(
+  data.frame(
+    model = "Elastic Net",
+    set = "train",
+    sample_id = pheno_train$sample_id,
+    age = y_train,
+    predicted_age = en_pred_train,
+    is_control = pheno_train$is_control
+  ),
+  data.frame(
+    model = "Elastic Net",
+    set = "test",
+    sample_id = pheno_test$sample_id,
+    age = y_test,
+    predicted_age = en_pred_test,
+    is_control = pheno_test$is_control
+  ),
+  data.frame(
+    model = "Scorcher DeepMAge",
+    set = "train",
+    sample_id = pheno_train$sample_id,
+    age = y_train,
+    predicted_age = dm_pred_train,
+    is_control = pheno_train$is_control
+  ),
+  data.frame(
+    model = "Scorcher DeepMAge",
+    set = "test",
+    sample_id = pheno_test$sample_id,
+    age = y_test,
+    predicted_age = dm_pred_test,
+    is_control = pheno_test$is_control
+  )
+)
+
+predictions$residual <- predictions$predicted_age - predictions$age
+
+final_config <- list(
+  n_hidden_layers = final_n_hidden_layers,
+  hidden_units = final_hidden_units,
+  activation = final_activation,
+  optimizer = final_optimizer,
+  dropout = final_dropout,
+  l2 = final_l2,
+  learning_rate = final_learning_rate,
+  batch_size = batch_size,
+  feature_epochs = feature_epochs,
+  tuning_epochs = tuning_epochs,
+  final_epochs = final_epochs,
+  cv_folds = cv_folds
+)
+
+training_object <- list(
+  config = final_config,
+  full_hyperparameter_grid = paper_grid,
+  tuning_grid = tuning_grid,
+  tuning_results = tuning_results,
+  feature_model = feature_fit,
+  final_model = deepmage_fit,
+  elastic_net = cv_en,
+  selected_features = selected_features,
+  feature_importance = feature_tbl,
+  train_center = train_center,
+  train_scale = train_scale,
+  metrics = metrics,
+  predictions = predictions
+)
+
+qs2::qs_save(training_object, fs::path(DIR_OUT, "deepmage_scorcher_training.qs"))
+qs2::qs_save(cv_en, fs::path(DIR_OUT, "elasticnet_final_model.qs"))
+qs2::qs_save(deepmage_fit, fs::path(DIR_OUT, "scorcher_deepmage_model.qs"))
+torch::torch_save(deepmage_fit$nn_model, fs::path(DIR_OUT, "scorcher_deepmage_model.pt"))
+
+readr::write_csv(metrics, fs::path(DIR_OUT, "model_comparison_results.csv"))
+readr::write_csv(predictions, fs::path(DIR_OUT, "predictions_all_samples.csv"))
+qs2::qs_save(metrics, fs::path(DIR_OUT, "model_comparison_results.qs"))
+qs2::qs_save(predictions, fs::path(DIR_OUT, "predictions_all_samples.qs"))
+
+plot_df <- predictions[predictions$set == "test", , drop = FALSE]
+
+p <- ggplot2::ggplot(plot_df, ggplot2::aes(age, predicted_age, color = model)) +
+  ggplot2::geom_point(alpha = 0.65, size = 1.8) +
+  ggplot2::geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  ggplot2::coord_equal() +
+  ggplot2::theme_minimal() +
+  ggplot2::labs(
+    x = "Chronological age",
+    y = "Predicted age",
+    color = NULL
+  )
+
+ggplot2::ggsave(
+  fs::path(DIR_OUT, "test_predictions_deepmage_scorcher.png"),
+  p,
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+
+message("\nHeadline controls-only metrics")
+print(metrics[metrics$cohort == "controls", , drop = FALSE])
+
+message("\nDone.")
 sessionInfo()
